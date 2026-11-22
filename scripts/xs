@@ -1,0 +1,1921 @@
+#!/usr/bin/env python3
+"""xs: the only writer of the ledger. The ledger is the branch xs-ledger, checked out once at .xs/ledger:
+the tracker (tasks, memory entries, the Log of each spec, ideas) and EVENTS.log. main holds the product and its
+decisions; no command of xs commits to main. The state of every entry derives from its events (PROTOCOL P2, §3).
+
+  xs install [--skills-dir DIR]            link the skills into each agent tool found in ~, or into DIR, with the tool's adapter
+  xs init                                  in a repo: add AGENTS.md and project/ (and the adapters' files), keeping every file already there; create the ledger
+  xs migrate                               once, in a repo that kept its tasks and EVENTS.log on main: move them to the ledger
+  xs status [T12|S03|ADR-0007|L02] | --unlanded   the state of every entry, of one, or of the tasks closed and not yet on main
+  xs status --since 2026-11-23             the report: every event since then
+  xs agent T12|--branch b started|stopped|finished run=<id> ...   an agent's life (tool, model, effort, role, session;
+                                           reason, resume_at, job; outcome); sent as an OpenTelemetry span when
+                                           OTEL_EXPORTER_OTLP_ENDPOINT is set
+  xs handoff T12 --next "step" [--open "request"]...   package a started task for another session, account or tool
+  xs takeover T12                          in any tool: prepare the worktree, apply the handed-off patch, print the brief
+  xs sync                                  with a forge's merge train: record as landed the closed tasks it merged
+  xs file [--type task|bug|prototype] [--priority p0|p1|p2|p3] [--spec S03] [--source TEXT] "title"
+  xs ask  [--priority p0|p1|p2|p3] [--spec S03] "question"   a decision task for the owner
+  xs next                                  tasks ready to start, p1 first; the WIP in use
+  xs start T12 --branch t12-slug           claim T12 and create its worktree from main
+  xs start T12 --branch b --run implementer   also launch AGENTS.md's "Agent implementer:" command there
+  xs close T12                             the worker closes T12 once its Done section holds the proof: closed, then done when it lands
+  xs answer T12                            the owner's answer is in T12's Done section: close it
+  xs answer T12 "answer"                   write the owner's answer in T12's Done section, then close it
+  xs block T12 "reason" | xs unblock T12 | xs drop T12 "why"
+  xs review T12                            the lead opens a review round of a doing task (PROTOCOL §6)
+  xs reviewed T12 approve|changes [--must-fix N]   the lead records the round's verdict and its must-fix findings
+  xs spec S12 opened|ready|done|dropped    a spec's status; ready runs the readiness gate, done checks its invariant tests on main
+  xs spec S12 approved|deviated|noted "line"   a dated line in the spec's Log, logs/S12.md in the ledger, with its event
+  xs adr 0007 proposed|accepted|retired ["line"]   an ADR's status, as an event; the ADR file is never edited
+  xs adr 0007 built "yes (T12)" | xs adr 0007 amended "ADR 0009 (what changed)"
+  xs release <name> [--commit <sha>] | xs rollback <name> "reason"   a release and its rollback, as events
+  xs incident open <slug> "line" [--sev 1|2|3|4] | resolve <slug>   an incident, for flow's time to restore
+  xs import-git [--dry-run]                once, for a repo with history: the events git can date
+  xs void T12 task.closed 2026-11-20T10:02:10Z "reason"   cancel a wrong event with a later one
+  xs where [...] | xs land [...]           run the scripts where and land beside xs (zsh has a builtin where)
+
+Memory (PROTOCOL §3): what an agent learns goes where its kind belongs; the agent proposes, the owner promotes.
+  xs idea [--source TEXT] "idea"           one dated line in IDEAS.md of the ledger
+  xs propose --kind rule|design|knowledge --anchor PATH --evidence TEXT [--to FILE] [--scope S] [--replaces L3] "entry"
+                                           --replaces: the amended text of a stale entry; promoting it retires L3
+  xs recommend L3 holds|retire "why"       the curator's recommendation on a stale entry, shown by xs queue
+  xs promote L3                            the owner accepts: the entry is written in its destination, marked (L3);
+                                           on a stale entry, the owner confirms it still holds
+  xs checked L3 "check"                    a check enforces it: the entry leaves its destination
+  xs retire L3 "why"                       the owner removes it
+  xs repeated L3 "what was corrected"     a correction the entry should have prevented (curator)
+  xs queue                                 what waits for the owner: open questions and proposals
+  xs stale MAIN                            entries whose anchor this branch changed become stale
+  xs load                                  for a session-start hook: records the recall of every loaded entry
+  xs search "words"                        entries matching the words, best first; records each recall
+Recalls go to the person's local log ($XS_HOME/events.log, default ~/.xs), never to git: one line per read.
+XS_SESSION names the session in a recall.
+
+An event line: <at> <scope> <subject> <kind> key=value ... (the contract of the ledger of events).
+Each command is one commit of the ledger, under a lock. Agents may edit the text of a task or an entry in
+.xs/ledger; xs commits that file with the next event about it, and refuses an EVENTS.log edited by hand.
+In a team, when main has an upstream, xs pulls the ledger before each command and pushes it after; a rejected push
+undoes the commit, pulls and runs the command again. XS_NO_PUSH=1 keeps the ledger local.
+XS_LEDGER renames the branch (default xs-ledger); the ledger's commits are not signed unless XS_LEDGER_SIGN=1; XS_SCOPE overrides the scope (project/<repo folder>); XS_BY names
+the actor (default: git user.name); MAIN names the base branch (default: main). The WIP limit is a line
+"WIP limit: <n>" in AGENTS.md. start --run <agent> launches the line "Agent <agent>: <command>" of AGENTS.md in the
+worktree, with the brief (--brief <file>, default the task file) as input; the log is in the git dir, xs-runs/<branch>.log.
+A task with `after: T41` (or several, comma-separated) is not ready until each is done or dropped, or is doing or closed
+on the branch it starts on: the chain it continues.
+"""
+import datetime as dt, fcntl, glob, json, os, re, shutil, subprocess, sys
+
+LEDGER = os.environ.get("XS_LEDGER", "xs-ledger")
+LOG = "EVENTS.log"
+PRIO = {"p0": 0, "p1": 1, "p2": 2, "p3": 3}  # p0: an incident; it stops the line
+TYPES = ("task", "bug", "decision", "prototype")
+ATTRS = "EVENTS.log merge=union\nIDEAS.md merge=union\nlogs/*.md merge=union\n"
+HERE = os.path.dirname(os.path.realpath(__file__))
+# the tool's bookkeeping, one commit per command: unsigned, or every command would wait for a signing prompt
+SIGN = [] if os.environ.get("XS_LEDGER_SIGN") else ["-c", "commit.gpgsign=false"]
+
+
+def die(msg):
+    sys.exit(f"xs: {msg}")
+
+
+def git(*a, check=True, input=None):
+    r = subprocess.run(["git", *a], capture_output=True, text=True, input=input)
+    if check and r.returncode:
+        die(f"git {' '.join(a)}: {r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def now():
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def utc(iso):
+    return dt.datetime.fromisoformat(iso).astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def common():
+    return git("rev-parse", "--path-format=absolute", "--git-common-dir")
+
+
+def main_wt():
+    return re.match(r"worktree (.+)", git("worktree", "list", "--porcelain")).group(1)
+
+
+def scope():
+    if os.environ.get("XS_SCOPE"):
+        return os.environ["XS_SCOPE"]
+    return "project/" + os.path.basename(os.path.dirname(common()))
+
+
+def actor():
+    return re.sub(r"\s+", "_", os.environ.get("XS_BY") or git("config", "user.name", check=False) or "unknown")
+
+
+def words(text):
+    """Free text inside an event field: one token."""
+    return re.sub(r"\s+", "_", text.strip())
+
+
+# --- the ledger: a branch with no history in common with main, checked out once -------------------------------
+
+_ledger = None
+
+
+def remote_of_main():
+    main = os.environ.get("MAIN", "main")
+    if not git("rev-parse", "--abbrev-ref", f"{main}@{{upstream}}", check=False):
+        return None
+    return git("config", f"branch.{main}.remote")
+
+
+def upstream():
+    """The remote the ledger follows: main's, in a team. None when solo or with XS_NO_PUSH."""
+    return None if os.environ.get("XS_NO_PUSH") else remote_of_main()
+
+
+def ledger():
+    """The ledger's checkout, created on first use: from the remote's branch in a team, else as an orphan."""
+    global _ledger
+    if _ledger:
+        return _ledger
+    path = os.path.join(main_wt(), ".xs", "ledger")
+    with Lock("xs-ledger-init.lock"):  # two first commands at once create it once
+        if not os.path.isdir(path):
+            create_ledger(path)
+    _ledger = path
+    return path
+
+
+def create_ledger(path):
+    exclude = os.path.join(common(), "info", "exclude")  # local: the ledger needs no commit on main
+    os.makedirs(os.path.dirname(exclude), exist_ok=True)
+    have = open(exclude).read() if os.path.exists(exclude) else ""
+    if "/.xs/" not in have.split():
+        open(exclude, "a").write(("" if have.endswith("\n") or not have else "\n") + "/.xs/\n")
+    if not git("rev-parse", "-q", "--verify", f"refs/heads/{LEDGER}", check=False):
+        # Even with XS_NO_PUSH: a clone that started its own ledger would number tasks a teammate already holds.
+        remote = remote_of_main()
+        if remote and subprocess.run(["git", "fetch", "-q", remote, LEDGER], capture_output=True).returncode == 0:
+            git("branch", LEDGER, "FETCH_HEAD")
+        elif remote and git("rev-parse", "-q", "--verify", f"refs/remotes/{remote}/{LEDGER}", check=False):
+            git("branch", LEDGER, f"refs/remotes/{remote}/{LEDGER}")
+        else:
+            tree = git("mktree", input="")
+            git("branch", LEDGER, git(*SIGN, "commit-tree", tree, "-m", "xs: the ledger"))
+    git("worktree", "prune")  # a checkout deleted by hand still holds the branch until pruned
+    git("worktree", "add", "-q", path, LEDGER)
+    seeded = []
+    tpl = os.path.join(os.path.dirname(HERE), "template", "ledger")
+    for d, _, names in os.walk(tpl):
+        for n in names:
+            dst = os.path.join(path, os.path.relpath(os.path.join(d, n), tpl))
+            if n != ".DS_Store" and not os.path.exists(dst):
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy(os.path.join(d, n), dst)
+                seeded.append(dst)
+    for name, text in ((".gitattributes", ATTRS), (LOG, "")):
+        if not os.path.exists(os.path.join(path, name)):
+            open(os.path.join(path, name), "w").write(text)
+            seeded.append(name)
+    if seeded:
+        git("-C", path, "add", "-A")
+        git("-C", path, *SIGN, "commit", "-q", "--no-verify", "-m", "xs: seed the ledger")
+
+
+def lpath(*parts):
+    return os.path.join(ledger(), *parts)
+
+
+class Lock:
+    def __init__(self, name="xs-ledger.lock"):
+        self.name = name
+
+    def __enter__(self):
+        self.f = open(os.path.join(common(), self.name), "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+
+    def __exit__(self, *_):
+        self.f.close()
+
+
+def unrecorded():
+    """Events the integrator could not write after main had moved: the next command writes them first."""
+    return os.path.join(common(), "xs-unrecorded.log")
+
+
+def dirty(L):
+    """The ledger's files with uncommitted text (a task's Done section, an answer): kept across an undone commit."""
+    out = {}
+    st = subprocess.run(["git", "-C", L, "status", "--porcelain", "-z", "-uall"], capture_output=True, text=True).stdout
+    for entry in st.split("\0"):  # not git(): its strip would eat the first entry's leading space
+        p = os.path.join(L, entry[3:])
+        if len(entry) > 3 and os.path.isfile(p):
+            out[p] = open(p, "rb").read()
+    return out
+
+
+def txn(prepare):
+    """One command, one commit of the ledger. prepare() validates against the ledger as it is now, edits files in it
+    (never on main: a retry runs it again) and returns (event lines, paths relative to the ledger, commit message,
+    result). In a team it runs after a pull, and again if a teammate's push came first: a claim taken meanwhile is
+    refused by prepare itself."""
+    global _state
+    L, remote = ledger(), upstream()
+    with Lock():
+        for _ in range(3):
+            if remote:
+                r = subprocess.run(["git", "-C", L, *SIGN, "pull", "-q", "--rebase", "--autostash", "--no-verify", remote, LEDGER],
+                                   capture_output=True, text=True)
+                if r.returncode and "couldn't find remote ref" not in r.stderr:
+                    subprocess.run(["git", "-C", L, "rebase", "--abort"], capture_output=True)  # never leave it mid-rebase
+                    die(f"pull of the ledger from {remote} failed: {r.stderr.strip()}")
+            log = os.path.join(L, LOG)
+            if (open(log).read() if os.path.exists(log) else "").strip() != git("-C", L, "show", f"HEAD:{LOG}", check=False):
+                die(f"{log} has changes xs did not make: the log only grows through xs. Undo them: git -C {L} checkout {LOG}")
+            _state = None
+            kept = dirty(L)
+            have = set(open(log).readlines()) if os.path.exists(log) else set()
+            pending = [l for l in (open(unrecorded()).readlines() if os.path.exists(unrecorded()) else []) if l not in have]
+            lines, paths, msg, result = prepare()
+            lines = pending + lines
+            if lines:
+                with open(log, "a") as f:
+                    f.writelines(lines)
+            paths = sorted(set(paths) | ({LOG} if lines else set()))
+            if paths:
+                git("-C", L, "add", "-A", "--", *paths)
+            if not paths or not git("-C", L, "diff", "--cached", "--name-only"):
+                return result
+            git("-C", L, *SIGN, "commit", "-q", "--no-verify", "-m", msg, "--", *paths)
+            _state = None
+            r = subprocess.run(["git", "-C", L, "push", "-q", "--no-verify", remote, f"{LEDGER}:{LEDGER}"],
+                               capture_output=True, text=True) if remote else None
+            rejected = r and r.returncode and ("rejected" in r.stderr or "fetch first" in r.stderr)
+            if not rejected:
+                if pending:
+                    os.remove(unrecorded())  # the local commit holds them now
+                if r and r.returncode:
+                    die(f"push of the ledger to {remote} failed: {r.stderr.strip()}")
+                return result
+            # A teammate pushed first: undo the commit, put back the text that was there before, pull, decide again.
+            git("-C", L, "reset", "-q", "--hard", "HEAD~1")
+            for p, data in kept.items():
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                open(p, "wb").write(data)
+        die(f"the ledger on {remote} kept moving: run the command again")
+
+
+def ev(subject, kind, at=None, **kv):
+    fields = " ".join(f"{k}={v}" for k, v in kv.items() if v not in (None, ""))
+    return f"{at or now()} {scope()} {subject} {kind} {fields}".rstrip() + "\n"
+
+
+def rel(path):
+    return os.path.relpath(path, ledger())
+
+
+# --- state, derived from the events ------------------------------------------------------------------------------
+
+_state = None
+LINE = re.compile(r"^(\S+) (\S+) (\S+) (\S+)(.*)$")
+
+
+def events(text=None):
+    if text is None:
+        log = lpath(LOG)
+        text = open(log).read() if os.path.exists(log) else ""
+    out = []
+    for line in text.splitlines():
+        m = LINE.match(line)
+        if m:
+            at, sc, subj, kind, rest = m.groups()
+            out.append(dict(at=at, subj=subj, kind=kind, kv=dict(re.findall(r"(\w+)=(\S+)", rest)), line=line))
+    void = {(e["subj"], e["kv"].get("of_kind"), e["kv"].get("of_at")) for e in out if e["kind"] == "event.voided"}
+    return [e for e in out if e["kind"] != "event.voided" and (e["subj"], e["kind"], e["at"]) not in void]
+
+
+def state_of(evs):
+    out = {}
+    for e in evs:
+        d = out.setdefault(e["subj"], {})
+        if e["kind"].startswith("agent."):  # an agent's life: beside the task's state, never its last event
+            d.setdefault("agents", {})[e["kv"].get("run", "-")] = e
+            continue
+        d["last"] = e
+        for k in ("status", "branch", "built", "amended"):
+            if e["kv"].get(k):
+                d[k] = e["kv"][k]
+    return out
+
+
+def state():
+    """subject -> its status, its branch, and its last event."""
+    global _state
+    if _state is None:
+        _state = state_of(events())
+    return _state
+
+
+def status_of(subject, default=""):
+    return state().get(subject, {}).get("status", default)
+
+
+def spec_status(sid):
+    return "ready" if sid == "S00" else status_of(sid, "draft")  # S00 holds the product's invariants and never closes
+
+
+# --- files -------------------------------------------------------------------------------------------------------
+
+def find(tid):
+    hits = glob.glob(lpath("tasks", f"{tid}-*.md"))
+    if len(hits) != 1:
+        die(f"{tid}: {'no task file' if not hits else 'several task files'} in {lpath('tasks')}")
+    return hits[0]
+
+
+def front(path):
+    text = open(path).read()
+    m = re.match(r"---\n(.*?\n)---\n", text, re.S)
+    if not m:
+        die(f"{path} has no frontmatter")
+    return text, m
+
+
+def get(path, key):
+    _, m = front(path)
+    v = re.search(rf"^{key}:[ \t]*([^\s#]*)", m.group(1), re.M)
+    return v.group(1) if v else ""
+
+
+def get_line(path, key):
+    _, m = front(path)
+    v = re.search(rf"^{key}:[ \t]*(.*)$", m.group(1), re.M)
+    return v.group(1) if v else ""
+
+
+def ident(path):
+    return os.path.basename(path).split("-")[0]
+
+
+def next_id(folder, prefix):
+    nums = [int(m.group(1)) for p in glob.glob(lpath(folder, f"{prefix}*-*.md")) if (m := re.match(rf"{prefix}(\d+)-", os.path.basename(p)))]
+    return f"{prefix}{max(nums, default=0) + 1:02d}"
+
+
+def check_text(path):
+    """A task's text: its type and priority inside the vocabulary, and no state, which lives in the events."""
+    if get(path, "status"):
+        die(f"{path} has a status: line: state lives in the ledger's events, remove the line")
+    if get(path, "type") not in TYPES:
+        die(f"{path} has type: {get(path, 'type') or 'nothing'}, outside {'|'.join(TYPES)}")
+    if get(path, "priority") not in PRIO:
+        die(f"{path} has priority: {get(path, 'priority') or 'nothing'}, outside p0|p1|p2|p3")
+
+
+def need_done(path):
+    if not re.search(r"^## Done[ \t]*$", open(path).read(), re.M):
+        die(f"{path} has no Done section: add the command that proves it, then close")
+
+
+def opt(args, name, default=""):
+    if name in args:
+        i = args.index(name)
+        if i + 1 >= len(args):
+            die(f"{name} needs a value")
+        v = args[i + 1]
+        del args[i:i + 2]
+        return v
+    return default
+
+
+def tasks():
+    return sorted(glob.glob(lpath("tasks", "T*-*.md")), key=lambda p: int(re.match(r"T(\d+)-", os.path.basename(p)).group(1)))
+
+
+# --- tasks -------------------------------------------------------------------------------------------------------
+
+def file_task(args, kind):
+    typ = "decision" if kind == "question.asked" else opt(args, "--type", "task")
+    prio, spec, source = opt(args, "--priority", "p2"), opt(args, "--spec"), opt(args, "--source")
+    if typ not in TYPES or prio not in PRIO or len(args) != 1:
+        die('usage: xs file [--type task|bug|prototype] [--priority p0|p1|p2|p3] [--spec S03] [--source TEXT] "title"')
+    title = args[0]
+    slug = "-".join(re.findall(r"[a-z0-9]+", title.lower())[:6]) or "task"
+    fm = [f"title: {title}", f"type: {typ}", f"priority: {prio}", f"created: {dt.date.today().isoformat()}"] + \
+        [f"{k}: {v}" for k, v in (("source", source), ("spec", spec)) if v]
+    body = "## What\n\n## Why\n\n## Where\n\n## Done when\n" if typ != "decision" else "## Question\n\n## Options\n\n## Recommendation\n"
+
+    def prepare():
+        tid = next_id("tasks", "T")  # one ledger: the numbers never collide between branches
+        path = lpath("tasks", f"{tid}-{slug}.md")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "w").write("---\n" + "\n".join(fm) + "\n---\n\n" + body)
+        line = ev(tid, kind, status="todo", type=typ, priority=prio, spec=spec.split()[0] if spec else "", by=actor())
+        return [line], [rel(path)], f"xs: file {tid} {title}", (tid, path)
+    tid, path = txn(prepare)
+    print(f"{tid} {path}")
+
+
+def ready(tid, path, branch=None):
+    """Why the task cannot start, or ''."""
+    status = status_of(tid)
+    if status != "todo":
+        return f"status is {status or 'missing'}"
+    spec = re.search(r"\bS\d+\b", get_line(path, "spec"))
+    if spec and spec_status(spec.group(0)) != "ready":
+        return f"its spec {spec.group(0)} is not ready"
+    return after_open(path, branch)
+
+
+def after_open(path, branch=None):
+    """The first task named in `after:` that is neither done nor dropped, as a reason, or ''.
+    A task doing or closed on the branch being started is the previous link of the same chain: it does not block."""
+    for t in re.findall(r"\bT\d+\b", get_line(path, "after")):
+        st = state().get(t, {})
+        status = st.get("status", "missing")
+        if status not in ("done", "dropped") and not (branch and status in ("doing", "closed") and st.get("branch") == branch):
+            return f"it comes after {t}, which is {status}"
+    return ""
+
+
+def wip():
+    limit = re.search(r"WIP limit:\s*(\d+)", open("AGENTS.md").read(), re.I) if os.path.exists("AGENTS.md") else None
+    return sum(status_of(ident(p)) == "doing" for p in tasks()), int(limit.group(1)) if limit else None
+
+
+def cmd_next(args):
+    rows = [(PRIO.get(get(p, "priority"), 9), p) for p in tasks() if not ready(ident(p), p)]
+    for _, p in sorted(rows, key=lambda r: r[0]):
+        print(f"{ident(p)} {get(p, 'priority')} {get(p, 'type')} {get_line(p, 'title')}")
+    doing, limit = wip()
+    print(f"doing: {doing}" + (f" of {limit}" if limit else " (no WIP limit)"))
+
+
+def cmd_start(args):
+    branch, run, brief = opt(args, "--branch"), opt(args, "--run"), opt(args, "--brief")
+    if len(args) != 1 or not branch:
+        die("usage: xs start T12 --branch <branch> [--run <agent> [--brief <file>]]")
+    command = agent_command(run) if run else None
+    tid, main = args[0], os.environ.get("MAIN", "main")
+    path = find(tid)
+    check_text(path)
+
+    def prepare():  # after the pull, in a team: a claim pushed by a teammate is seen here
+        st = state().get(tid, {})
+        if st.get("status") == "doing":
+            if st.get("branch") != branch:
+                die(f"{tid} is doing on {st.get('branch')}: claimed elsewhere, run xs next")
+            return [], [], "", None  # idempotent: run again, it only recreates a missing worktree
+        why = ready(tid, path, branch)
+        if why:
+            die(f"{tid} cannot start: {why}")
+        doing, limit = wip()
+        if limit is not None and doing >= limit:
+            die(f"WIP limit reached: {doing} of {limit} tasks doing (AGENTS.md)")
+        line = ev(tid, "task.started", status="doing", branch=branch, by=actor(), agent=run or None)
+        return [line], [rel(path)], f"xs: start {tid} on {branch}", None
+    txn(prepare)
+    wt = os.path.join(main_wt(), ".xs", "worktrees", branch)
+    if not os.path.isdir(wt):  # idempotent: the claim may have been recorded before a crash
+        exists = git("rev-parse", "-q", "--verify", f"refs/heads/{branch}", check=False)
+        git("worktree", "add", "-q", wt, *([branch] if exists else ["-b", branch, main]))
+    print(f"{tid} doing on {branch}\nworktree: {wt}\ntask: {path}")
+    if command:  # outside the claim: at least once, a second start launches it again
+        brief = os.path.abspath(brief or path)
+        logs = os.path.join(common(), "xs-runs")
+        os.makedirs(logs, exist_ok=True)
+        out = os.path.join(logs, f"{branch}.log")
+        xs, q = os.path.join(HERE, "xs"), tid
+        # the agent's life as events: started now, finished or stopped (reason=error) when the command exits; run = the shell's pid
+        wrapped = (f"( {command} ); rc=$?; if [ $rc -eq 0 ]; then \"{xs}\" agent {q} finished run={run}-$$ exit=0; "
+                   f"else \"{xs}\" agent {q} stopped run={run}-$$ reason=error exit=$rc; fi")
+        with open(brief) as i, open(out, "a") as o:
+            p = subprocess.Popen(wrapped, shell=True, cwd=wt, stdin=i, stdout=o, stderr=o, start_new_session=True)
+        cmd_agent([tid, "started", f"run={run}-{p.pid}", f"role={run}"])
+        print(f"agent: {run} (pid {p.pid}), log: {out}")
+
+
+def agent_command(name):
+    """The headless command AGENTS.md declares for an agent: a line "Agent <name>: <command>"."""
+    text = open("AGENTS.md").read() if os.path.exists("AGENTS.md") else ""
+    m = re.search(rf"^[-*\s]*Agent {re.escape(name)}:\s*`?([^`\n]+?)`?\s*$", text, re.M)
+    if not m:
+        die(f"no agent {name} in AGENTS.md: add a line \"Agent {name}: <headless command>\"")
+    return m.group(1)
+
+
+# --- agents (PROTOCOL §8): one agent's life as events, the same for every tool ------------------------------------
+
+# reason: ACP's stopReason (end_turn, max_tokens, max_turn_requests, refusal, cancelled), and what ACP does not carry
+STOPS = ("end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled", "limit", "error", "killed")
+AGENT_KEYS = {"started": ("run", "tool", "model", "effort", "role", "session"),
+              "stopped": ("run", "reason", "resume_at", "job", "exit"),
+              "finished": ("run", "outcome", "exit")}
+
+
+def cmd_agent(args):
+    """xs agent T12|--branch b started|stopped|finished key=value ...: written by xs start --run, a tool's hook, or the lead."""
+    branch = opt(args, "--branch")
+    usage = "usage: xs agent T12|--branch <b> started|stopped|finished run=<id> [" + \
+            "; ".join(f"{k}: {' '.join(v[1:])}" for k, v in AGENT_KEYS.items()) + "]"
+    if branch:
+        doing = [t for t, d in state().items() if re.match(r"T\d+$", t) and d.get("status") == "doing" and d.get("branch") == branch]
+        if not doing:
+            print(f"no task doing on {branch}: nothing recorded")
+            return  # a hook in a session outside the factory: never an error
+        args = [doing[0]] + args
+    if len(args) < 2 or args[1] not in AGENT_KEYS:
+        die(usage)
+    tid, what = args[0], args[1]
+    find(tid)
+    if not state().get(tid, {}).get("branch"):
+        print(f"{tid} was never started: nothing recorded")
+        return  # a hook saw a task named in a prompt that no xs start claimed
+    kv = dict(a.split("=", 1) for a in args[2:] if "=" in a)
+    bad = [k for k in kv if k not in AGENT_KEYS[what]] + [a for a in args[2:] if "=" not in a]
+    if bad or any(not re.fullmatch(r"[\w.:@/+-]+", v) for v in kv.values()):
+        die(f"{' '.join(bad) or 'a value with a space or a quote'}: {usage}")
+    if what == "stopped" and kv.get("reason") not in STOPS:
+        die(f"reason is one of {', '.join(STOPS)}")
+    if what == "finished" and not kv.get("outcome"):
+        kv["outcome"] = status_of(tid, "todo")  # closed, blocked, or still doing: the agent ended without closing it
+    kv.setdefault("run", "-")
+    line = ev(tid, f"agent.{what}", **kv)
+    txn(lambda: ([line], [], f"xs: agent {what} on {tid}", None))
+    export([line])
+    print(line.strip())
+
+
+def export(lines):
+    """With OTEL_EXPORTER_OTLP_ENDPOINT set, an agent's run goes out as one OpenTelemetry span (GenAI conventions)
+    when it ends: from agent.started to agent.stopped or agent.finished, one trace per task. Never fails a command."""
+    url = os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") or \
+        (os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"].rstrip("/") + "/v1/traces" if os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") else "")
+    spans = [s for s in (span_of(e) for e in events("".join(lines))) if s]
+    if not url or not spans:
+        return
+    import urllib.request
+    headers = {"Content-Type": "application/json"}
+    for h in filter(None, os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", "").split(",")):
+        k, _, v = h.partition("=")
+        headers[k.strip()] = urllib.request.unquote(v.strip())
+    body = {"resourceSpans": [{"resource": {"attributes": attrs({"service.name": os.environ.get("OTEL_SERVICE_NAME", "xs"), "xs.scope": scope()})},
+                               "scopeSpans": [{"scope": {"name": "xs"}, "spans": spans}]}]}
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, json.dumps(body).encode(), headers), timeout=5)
+    except Exception as e:  # the ledger holds the event: the exporter is a copy
+        print(f"xs: OTLP export to {url} failed: {e}", file=sys.stderr)
+
+
+def attrs(d):
+    return [{"key": k, "value": {"stringValue": str(v)}} for k, v in d.items() if v not in (None, "", "-")]
+
+
+def span_of(end):
+    """The span of a run that ended with this event, or None."""
+    import hashlib
+    if end["kind"] not in ("agent.stopped", "agent.finished"):
+        return None
+    run, tid = end["kv"].get("run", "-"), end["subj"]
+    start = next((e for e in reversed(events()) if e["subj"] == tid and e["kind"] == "agent.started"
+                  and e["kv"].get("run", "-") == run and e["at"] <= end["at"]), None)
+    s = (start or end)["kv"]
+    ns = lambda at: str(int(dt.datetime.fromisoformat(at.replace("Z", "+00:00")).timestamp() * 1e9))
+    h = lambda x, n: hashlib.sha256(x.encode()).hexdigest()[:n]
+    reason = end["kv"].get("reason")
+    return {"traceId": h(f"{scope()} {tid}", 32), "spanId": h(f"{scope()} {tid} {run} {(start or end)['at']}", 16),
+            "name": f"invoke_agent {s.get('role') or tid}", "kind": 1,
+            "startTimeUnixNano": ns((start or end)["at"]), "endTimeUnixNano": ns(end["at"]),
+            "attributes": attrs({"gen_ai.operation.name": "invoke_agent", "gen_ai.agent.name": s.get("role"),
+                                 "gen_ai.provider.name": s.get("tool"), "gen_ai.request.model": s.get("model"),
+                                 "gen_ai.conversation.id": s.get("session"), "xs.task": tid, "xs.run": run,
+                                 "xs.effort": s.get("effort"), "xs.reason": reason, "xs.outcome": end["kv"].get("outcome"),
+                                 "xs.resume_at": end["kv"].get("resume_at"), "xs.job": end["kv"].get("job")}),
+            "status": {"code": 2 if reason in ("error", "killed", "refusal") else 1}}
+
+
+# --- handoff (PROTOCOL §8): the state of a task in git, so that any tool can take it over -------------------------
+
+def worktree_of(branch):
+    return os.path.join(main_wt(), ".xs", "worktrees", branch)
+
+
+def cmd_handoff(args):
+    """Package a task for another session, account or tool: a brief, the branch's head, the uncommitted work as a patch."""
+    nxt, opened = opt(args, "--next"), []
+    while "--open" in args:
+        opened.append(opt(args, "--open"))
+    if len(args) != 1 or not nxt:
+        die('usage: xs handoff T12 --next "the next step" [--open "a request of the owner not yet done"]...')
+    tid = args[0]
+    path, d = find(tid), state().get(tid, {})
+    branch = d.get("branch")
+    if not branch or d.get("status") not in ("doing", "blocked", "closed"):
+        die(f"{tid} is {d.get('status', 'todo')}: only a started task is handed off; a new one starts with xs start")
+    wt, stamp = worktree_of(branch), now().replace(":", "")
+    head = git("rev-parse", "--short", branch, check=False) or "none"
+    patch = ""
+    if os.path.isdir(wt):  # the uncommitted work, untracked files included, without touching the worktree's index
+        idx = os.path.join(common(), f"xs-handoff-{os.getpid()}.index")
+        env = {**os.environ, "GIT_INDEX_FILE": idx}
+        subprocess.run(["git", "-C", wt, "read-tree", "HEAD"], env=env, check=True)
+        subprocess.run(["git", "-C", wt, "add", "-A"], env=env, check=True)
+        patch = subprocess.run(["git", "-C", wt, "diff", "--cached", "--binary", "HEAD"], env=env, capture_output=True, text=True).stdout
+        os.remove(idx)
+    agent = next((e for e in reversed(events()) if e["subj"] == tid and e["kind"] == "agent.started"), None)
+    a = agent["kv"] if agent else {}
+    name = f"{tid}-{stamp}"
+    body = f"""# Handoff of {tid}: {get_line(path, 'title')}
+
+Handed off on {now()} by {actor()}.
+
+- Task: {rel(path)} ({d.get('status')}), spec: {get(path, 'spec') or 'none'}
+- Branch: {branch} at {head}; worktree: .xs/worktrees/{branch}
+- Uncommitted work: {f'handoffs/{name}.patch ({len(patch.splitlines())} lines), applied by xs takeover' if patch else 'none'}
+- Last agent: {' '.join(f'{k}={v}' for k, v in a.items()) if a else 'none recorded'}
+
+## Next step
+
+{nxt}
+
+## Open requests of the owner
+
+{chr(10).join(f'- {o}' for o in opened) or '- none'}
+
+## Brief
+
+You take over {tid} from another session. Run `xs takeover {tid}` from the repo: it prepares the worktree
+.xs/worktrees/{branch} with the work left uncommitted, and prints this file. Then read the task file, `xs status {tid}`
+and the Log of its spec before anything else; do not rebuild the state from a chat. Do the next step above, then
+each open request, filing with `xs file` what you do not do.
+""" + (f"The same tool can resume the session itself instead: session {a['session']} (ACP `session/load`).\n" if a.get("session") else "")
+
+    def prepare():
+        os.makedirs(lpath("handoffs"), exist_ok=True)
+        open(lpath("handoffs", name + ".md"), "w").write(body)
+        files = [f"handoffs/{name}.md"]
+        if patch:
+            open(lpath("handoffs", name + ".patch"), "w").write(patch)
+            files.append(f"handoffs/{name}.patch")
+        return [ev(tid, "task.handed_off", file=f"handoffs/{name}.md", head=head, by=actor())], files, f"xs: hand off {tid}", None
+    txn(prepare)
+    remote = upstream()
+    if remote and not os.environ.get("XS_NO_PUSH") and head != "none":  # another machine takes it over from the remote
+        git("push", "-q", remote, f"{branch}:{branch}", check=False)
+    print(f"handed off {tid}: {lpath('handoffs', name + '.md')}")
+
+
+def cmd_takeover(args):
+    """Take over a handed-off task, in any tool: prepare its worktree, apply its patch, print its brief."""
+    if len(args) != 1:
+        die("usage: xs takeover T12")
+    tid = args[0]
+    find(tid)
+    last = next((e for e in reversed(events()) if e["subj"] == tid and e["kind"] == "task.handed_off"), None)
+    if not last:
+        die(f"{tid} has no handoff: take a stopped session over by the lead's rule (its last prompts, xs file what is open)")
+    md = lpath(last["kv"]["file"])
+    branch, head = state()[tid]["branch"], last["kv"].get("head")
+    wt = worktree_of(branch)
+    if not git("rev-parse", "-q", "--verify", f"refs/heads/{branch}", check=False) and upstream():
+        git("fetch", "-q", upstream(), f"{branch}:{branch}", check=False)
+    if not os.path.isdir(wt):
+        if not git("rev-parse", "-q", "--verify", f"refs/heads/{branch}", check=False):
+            die(f"no branch {branch} here or on the remote: the handoff names a head that never left its machine")
+        git("worktree", "add", "-q", wt, branch)
+    now_head = git("-C", wt, "rev-parse", "--short", "HEAD")
+    if head not in (None, "none") and now_head != head:
+        print(f"note: {branch} is at {now_head}, the handoff was at {head}: read what changed since")
+    patch = md[:-3] + ".patch"
+    if os.path.exists(patch):
+        if subprocess.run(["git", "-C", wt, "apply", "--check", patch], capture_output=True).returncode == 0:
+            git("-C", wt, "apply", patch)
+            print(f"applied {patch}")
+        elif subprocess.run(["git", "-C", wt, "apply", "--reverse", "--check", patch], capture_output=True).returncode == 0:
+            print("the uncommitted work is already in the worktree")
+        else:
+            die(f"{patch} does not apply to {wt}: it has other changes; resolve them, then run xs takeover again")
+    txn(lambda: ([ev(tid, "task.taken_over", file=last["kv"]["file"], by=actor())], [], f"xs: take over {tid}", None))
+    print(f"worktree: {wt}\n")
+    print(open(md).read().rstrip())
+
+
+def forge_of():
+    f = os.environ.get("LAND_FORGE")
+    if f is None and os.path.isfile("AGENTS.md"):
+        m = re.search(r"^- Merge train:\s*(github|gitlab)\b", open("AGENTS.md").read(), re.M)
+        f = m and m.group(1)
+    return f or None
+
+
+def forge_rejects(forge, branch):
+    """Why the forge holds the branch's request back (red, changes-requested, conflict, closed), or None."""
+    cmd = ["gh", "pr", "view", branch, "--json", "state,mergeStateStatus,reviewDecision,statusCheckRollup"] if forge == "github" \
+        else ["glab", "mr", "view", branch, "-F", "json"]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        r = json.loads(p.stdout) if p.returncode == 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        r = None
+    if not isinstance(r, dict):
+        return None  # no request, or no CLI: nothing to say
+    if forge == "github":
+        bad = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED"}
+        checks = r.get("statusCheckRollup") or []
+        return ("closed" if r.get("state") == "CLOSED" else
+                "red" if any((c.get("conclusion") or c.get("state")) in bad for c in checks) else
+                "changes-requested" if r.get("reviewDecision") == "CHANGES_REQUESTED" else
+                "conflict" if r.get("mergeStateStatus") == "DIRTY" else None)
+    pipe = r.get("head_pipeline") or r.get("pipeline") or {}
+    return ("closed" if r.get("state") == "closed" else
+            "red" if pipe.get("status") in ("failed", "canceled") else
+            "changes-requested" if r.get("detailed_merge_status") == "requested_changes" else
+            "conflict" if r.get("has_conflicts") else None)
+
+
+def cmd_sync(args):
+    """With a forge (Merge train: github|gitlab), the forge moves main: record the tasks whose branch it merged,
+    and as ejected those whose request it holds back (a red pipeline, changes requested, a conflict, closed)."""
+    main = os.environ.get("MAIN", "main")
+    remote = remote_of_main() or "origin"
+    git("fetch", "-q", remote, main)
+    on = f"{remote}/{main}"
+    forge = forge_of()
+    if forge and not shutil.which("gh" if forge == "github" else "glab"):
+        print(f"xs: {'gh' if forge == 'github' else 'glab'} not found: ejections not checked", file=sys.stderr)
+
+    def prepare():
+        merged, ejected = {}, {}
+        for t, d in state().items():
+            b = d.get("branch")
+            if not (re.match(r"T\d+$", t) and d.get("status") == "closed" and b and git("rev-parse", "-q", "--verify", f"refs/heads/{b}", check=False)):
+                continue
+            if not any(l.startswith("+") for l in git("cherry", on, b).splitlines()):  # by patch: a rebase merge counts
+                merged[t] = b
+            elif forge:
+                why = forge_rejects(forge, b)
+                last = d.get("last") or {}
+                if why and not (last.get("kind") == "land.ejected" and last["kv"].get("reason") == why):  # once per reason
+                    ejected[t] = (b, why)
+        head = git("rev-parse", "--short", on)
+        lines = [ev(t, "landed", status="done", on=main, commit=head, branch=b, by="forge") for t, b in sorted(merged.items())]
+        lines += [ev(t, "land.ejected", branch=b, reason=why, by="forge") for t, (b, why) in sorted(ejected.items())]
+        return lines, [], "xs: sync from the forge", (merged, ejected)
+    merged, ejected = txn(prepare)
+    for t, b in sorted(merged.items()):
+        print(f"{t} landed by the forge ({b})")
+    for t, (b, why) in sorted(ejected.items()):
+        print(f"{t} ejected by the forge ({b}): {why}")
+    if not merged and not ejected:
+        print(f"nothing new on {on}")
+
+
+def nothing_to_land(branch):
+    """No branch, or a branch whose every change is on main (cherry-picked by the integrator counts)."""
+    if not branch:
+        return True
+    if not git("rev-parse", "-q", "--verify", f"refs/heads/{branch}", check=False):
+        return False  # gone: cannot tell, the integrator's landed event decides
+    return not any(l.startswith("+") for l in git("cherry", os.environ.get("MAIN", "main"), branch).splitlines())
+
+
+def transition(args, kind, status, need_reason=False):
+    if len(args) != (2 if need_reason else 1):
+        die(f"usage: xs {sys.argv[1]} T12" + (' "reason"' if need_reason else ""))
+    tid = args[0]
+    path = find(tid)
+
+    def prepare():
+        current, new = status_of(tid), status
+        if current in ("done", "dropped") or (current == "closed" and kind != "task.dropped"):
+            die(f"{tid} is already {current}")
+        if kind in ("task.closed", "question.answered"):
+            check_text(path)
+            need_done(path)
+        if kind == "question.answered" and get(path, "type") != "decision":
+            die(f"{tid} is not a decision task: close it with xs close")
+        if kind == "task.closed" and get(path, "type") == "decision":
+            die(f"{tid} is a decision: close it with xs answer")
+        if kind == "task.unblocked":
+            if current != "blocked":
+                die(f"{tid} is not blocked")
+            new = "doing" if state().get(tid, {}).get("branch") else "todo"
+        if kind == "task.closed" and nothing_to_land(state().get(tid, {}).get("branch")):
+            new = "done"  # never started, or its branch is already on main: no integrator would ever land it
+        if need_reason:
+            with open(path, "a") as f:
+                f.write(f"\n{'Dropped' if kind == 'task.dropped' else 'Blocked'}: {args[1]}\n")
+        line = ev(tid, kind, status=new, reason=words(args[1]) if need_reason else None, by=actor())
+        files = [rel(f) for f in glob.glob(lpath("tasks", f"{tid}-*"))]  # the task and its saved patch, if any
+        return [line], files, f"xs: {kind.split('.')[1]} {tid}", new
+    new = txn(prepare)
+    print(f"{tid} {new}" + (": it is done once the integrator lands its branch" if new == "closed" else ""))
+
+
+def cmd_answer(args):
+    """xs answer T12 ["answer"]: with the answer, write it in the task's Done section first."""
+    if len(args) == 2:
+        path = find(args[0])
+        if get(path, "type") != "decision":
+            die(f"{args[0]} is not a decision task: close it with xs close")
+        if status_of(args[0]) in ("done", "dropped"):
+            die(f"{args[0]} is already {status_of(args[0])}")
+        if not args[1].strip() or "\n" in args[1]:
+            die("the answer is one line, not empty")
+        text = open(path).read().rstrip("\n")
+        m = re.search(r"^## Done[ \t]*$", text, re.M)
+        if not m:
+            text += f"\n\n## Done\n\n{args[1]}"
+        else:
+            # At the end of the Done section: before the next heading, or at the file's end.
+            nxt = re.search(r"^## ", text[m.end():], re.M)
+            at = m.end() + nxt.start() if nxt else len(text)
+            text = text[:at].rstrip("\n") + f"\n\n{args[1]}" + ("\n\n" + text[at:] if nxt else "")
+        with open(path, "w") as f:
+            f.write(text + "\n")
+        args = args[:1]
+    transition(args, "question.answered", "done")
+
+
+# --- specs and ADRs: their text on main, their state in the ledger -----------------------------------------------
+
+def spec_file(sid):
+    hits = glob.glob(f"project/specs/{sid}-*.md")
+    if len(hits) != 1:
+        die(f"{sid}: no single spec file in project/specs")
+    return hits[0]
+
+
+def test_names(path):
+    return re.findall(r"Test: `([^`]+)`", open(path).read())
+
+
+def missing_tests(path, main):
+    """The invariant tests the spec names that main does not hold, outside project/: in any case, spaces or underscores."""
+    out = []
+    for name in test_names(path):
+        rx = re.sub(r"\\?[ _]", "[ _]", re.escape(name))
+        if subprocess.run(["git", "grep", "-qiE", "-e", rx, main, "--", ".", ":!project"], capture_output=True).returncode:
+            out.append(name)
+    return out
+
+
+def open_round(tid, evs):
+    """The round of the task's open review: its last review.started, if no verdict of that round follows it."""
+    starts = [i for i, e in enumerate(evs) if e["kind"] == "review.started"]
+    if not starts:
+        return None
+    rnd = evs[starts[-1]]["kv"].get("round")
+    return None if any(e["kind"] == "review.verdict" and e["kv"].get("round") == rnd for e in evs[starts[-1] + 1:]) else rnd
+
+
+def cmd_review(args):
+    """The lead opens a review round of a doing task; the tool counts the rounds, so that
+    "stop after three review rounds" reads from the ledger."""
+    if len(args) != 1:
+        die("usage: xs review T12")
+    tid = args[0]
+    find(tid)
+
+    def prepare():
+        if status_of(tid) != "doing":
+            die(f"{tid} is {status_of(tid) or 'without a status'}: only a doing task is reviewed")
+        rnd = 1 + sum(e["kind"] == "review.started" for e in events() if e["subj"] == tid)
+        return [ev(tid, "review.started", round=rnd, by=actor())], [], f"xs: review {tid} round {rnd}", rnd
+    print(f"{tid} review round {txn(prepare)}")
+
+
+def cmd_reviewed(args):
+    """The verdict of the open review round, with the number of its must-fix findings."""
+    must = opt(args, "--must-fix", "0")
+    if len(args) != 2 or args[1] not in ("approve", "changes"):
+        die("usage: xs reviewed T12 approve|changes [--must-fix N]")
+    if not re.fullmatch(r"\d+", must):
+        die(f"--must-fix takes a whole number, not {must}")
+    tid, verdict, must = args[0], args[1], int(must)
+    if verdict == "approve" and must:
+        die(f"{tid}: an approval leaves no must-fix open; record {must} must-fix with changes")
+    find(tid)
+
+    def prepare():
+        rnd = open_round(tid, [e for e in events() if e["subj"] == tid])
+        if not rnd:
+            die(f"{tid} has no open review: open one with xs review {tid}")
+        return [ev(tid, "review.verdict", verdict=verdict, round=rnd, must_fix=must, by=actor())], [], f"xs: reviewed {tid} round {rnd}", rnd
+    rnd = txn(prepare)
+    print(f"{tid} review round {rnd} {verdict}")
+    if verdict == "changes" and int(rnd) >= 3:
+        print(f"xs: warning: round {rnd} asks for changes; PROTOCOL §6 says stop after three review rounds "
+              "and return to Definition", file=sys.stderr)
+
+
+def cmd_spec(args):
+    kinds = {"opened": "draft", "ready": "ready", "done": "done", "dropped": "dropped", "approved": "", "deviated": "", "noted": ""}
+    lined = ("approved", "deviated", "noted")
+    if len(args) < 2 or args[1] not in kinds or (args[1] in lined) != (len(args) == 3):
+        die('usage: xs spec S12 opened|ready|done|dropped, or xs spec S12 approved|deviated|noted "line"')
+    sid, kind = args[0], args[1]
+    if sid == "S00" and kind in ("done", "dropped"):
+        die("S00 never closes: it holds the invariants of the whole product")
+    path = spec_file(sid)
+    if kind == "ready":
+        fails = readiness(sid, path)
+        if fails:
+            die(f"{sid} is not ready:\n" + "\n".join(f"  {i}. {f}" for i, f in enumerate(fails, 1)))
+    if kind == "done":
+        main = os.environ.get("MAIN", "main")
+        gone = missing_tests(path, main)
+        if gone:
+            die(f"{sid} names tests that {main} does not hold: " + "; ".join(gone) + ". Land them before closing the spec")
+
+    def prepare():
+        paths = []
+        if kind in lined:  # the Log only grows, one dated line each
+            log = lpath("logs", f"{sid}.md")
+            os.makedirs(os.path.dirname(log), exist_ok=True)
+            who = {"approved": f"approved by {actor()}: ", "deviated": "deviated: ", "noted": ""}[kind]
+            with open(log, "a") as f:
+                f.write(f"- {dt.date.today().isoformat()}: {who}{args[2]}\n")
+            paths.append(rel(log))
+        line = ev(sid, f"spec.{'closed' if kind == 'done' else kind}", status=kinds[kind], by=actor())
+        return [line], paths, f"xs: spec {sid} {kind}", None
+    txn(prepare)
+    print(f"{sid} {kind}" + (f": {spec_status(sid)}" if kinds[kind] else f", in {lpath('logs', sid + '.md')}"))
+
+
+def readiness(sid, path):
+    """The readiness gate of PROTOCOL §4, as far as text and events can show it: every failure, not only the first.
+    Whether the outcome is verifiable by someone else stays the reviewer's judgment; this catches what is missing."""
+    text = open(path).read()
+    sec = {m.group(1).strip(): m.group(2) for m in re.finditer(r"^## (.+)\n((?:(?!^## ).*\n?)*)", text, re.M)}
+    items = lambda name: [s.strip() for s in re.split(r"\n(?=- )", sec.get(name, "")) if s.strip().startswith("- ")]
+    label = lambda it: (re.match(r"- ([RI]\d+)", it) or re.match(r"- (.{0,30})", it)).group(1)
+    fails = []
+    if not sec.get("Outcome", "").strip():
+        fails.append("the Outcome section is empty")
+    reqs = items("Requirements")
+    if not reqs and sid != "S00":  # S00 holds only the product's invariants
+        fails.append("the spec states no requirement")
+    for it in reqs:
+        if not re.match(r"- R\d+: \S", it):
+            fails.append(f"a requirement has no id: {it[:40]}")
+        elif w := re.search(r"\b(fast|simple|intuitive|easy|user-friendly)\b", it, re.I):
+            fails.append(f"{label(it)} says \"{w.group(1)}\": state it so that someone else can measure it")
+    num = sid[1:]
+    for it in items("Invariants"):  # the name, in any case, with spaces or underscores, as missing_tests matches it
+        if not re.search(rf"Test: `s{num}[ _]{label(it)}\b", it, re.I):
+            fails.append(f"{label(it)} names no test starting with `{sid} {label(it)}`")
+    cited = {i for t in tasks() if get_line(t, "spec").split()[:1] == [sid] for i in re.findall(r"\bI\d+\b", get_line(t, "spec"))}
+    for name in missing_tests(path, os.environ.get("MAIN", "main")):  # a test still to write is a task before the build
+        inv = re.search(r"\bI\d+\b", name, re.I)
+        if inv and inv.group(0).upper() not in cited:
+            fails.append(f"no task writes the test of {inv.group(0).upper()}: xs file --priority p1 --spec \"{sid} {inv.group(0).upper()}\" \"...\", "
+                         "and give the build tasks after: it")
+    for it in [i for name in sec for i in items(name)] + [l for l in text.splitlines() if "[ASSUMPTION]" in l and not l.startswith("- ")]:
+        if "[ASSUMPTION]" in it:
+            fails.append(f"{label(it)} is an unconfirmed [ASSUMPTION]: ask the owner")
+    for it in items("Open"):
+        if not re.search(r"\b(task|spike|question)\b", it, re.I):
+            fails.append(f"open item \"{it[2:40]}\" has no route: task, spike or question")
+    for it in items("Decisions"):
+        m = re.match(r"- ADR (\d{4})\b", it)
+        if not m:
+            fails.append(f"decision has no ADR: {it[2:40]}")
+        elif not glob.glob(f"project/adr/{m.group(1)}-*.md"):
+            fails.append(f"ADR {m.group(1)} does not exist in project/adr")
+        elif status_of(f"ADR-{m.group(1)}") != "accepted":
+            fails.append(f"ADR {m.group(1)} is not accepted: xs adr {m.group(1)} accepted, by the owner")
+    owner = words(get_line(path, "owner"))
+    waived = os.path.exists("AGENTS.md") and re.search(r"^- Spec approval:\s*none\b", open("AGENTS.md").read(), re.M | re.I)
+    approvers = {e["kv"].get("by", "").lower() for e in events() if e["subj"] == sid and e["kind"] == "spec.approved"}
+    if not owner:
+        fails.append("the spec names no owner")
+    elif owner.lower() not in approvers and not waived:
+        fails.append(f"{owner} has not approved the spec: xs spec {sid} approved \"what\", run by {owner}")
+    return fails
+
+
+def cmd_adr(args):
+    """An ADR's file is its decision, never edited; its status, Built and Amended by are events."""
+    kinds = ("proposed", "accepted", "amended", "built", "retired")
+    if len(args) not in (2, 3) or args[1] not in kinds or (args[1] in ("amended", "built") and len(args) == 2) \
+            or (args[1] == "built" and not re.match(r"(no|partly|yes)\b", args[2])):
+        die('usage: xs adr 0007 proposed|accepted|retired ["line"], xs adr 0007 built "no|partly|yes (T12)", '
+            'or xs adr 0007 amended "ADR 0009 (what changed)"')
+    num, kind = re.sub(r"^ADR-?", "", args[0]), args[1]
+    if not re.match(r"\d{4}$", num) or len(glob.glob(f"project/adr/{num}-*.md")) != 1:
+        die(f"{args[0]}: no single ADR file in project/adr")
+    line = args[2].rstrip(".") if len(args) == 3 else ""
+    sid = f"ADR-{num}"
+
+    def prepare():
+        status = kind if kind in ("proposed", "accepted", "retired") else status_of(sid, "proposed")
+        extra = {"built": words(line)} if kind == "built" else {"amended": words(line)} if kind == "amended" else {"note": words(line) or None}
+        return [ev(sid, f"adr.{kind}", status=status, **extra, by=actor())], [], f"xs: {sid} {kind}", status
+    status = txn(prepare)
+    print(f"{sid} {kind}: {status}")
+
+
+# --- events with no file ------------------------------------------------------------------------------------------
+
+def record(line, msg):
+    txn(lambda: ([line], [], msg, None))
+
+
+def cmd_release(args):
+    sha = opt(args, "--commit")
+    if len(args) != 1:
+        die("usage: xs release <name> [--commit <sha>]")
+    record(ev(args[0], "released", commit=sha, by=actor()), f"xs: release {args[0]}")
+    print(f"{args[0]} released")
+
+
+def cmd_rollback(args):
+    if len(args) != 2:
+        die('usage: xs rollback <name> "reason"')
+    record(ev(args[0], "rolled-back", reason=words(args[1]), by=actor()), f"xs: roll back {args[0]}")
+    print(f"{args[0]} rolled back")
+
+
+def cmd_incident(args):
+    """An incident is open from incident.opened to incident.resolved: flow reads the time to restore."""
+    sev = opt(args, "--sev", "2")
+    if sev not in ("1", "2", "3", "4") or not ((len(args) == 3 and args[0] == "open") or (len(args) == 2 and args[0] == "resolve")):
+        die('usage: xs incident open <slug> "line" [--sev 1|2|3|4], or xs incident resolve <slug>')
+    slug = args[1]
+
+    def prepare():
+        kinds = [e["kind"] for e in events() if e["subj"] == slug and e["kind"] in ("incident.opened", "incident.resolved")]
+        is_open = bool(kinds) and kinds[-1] == "incident.opened"
+        if args[0] == "open" and is_open:
+            die(f"incident {slug} is already open")
+        if args[0] == "resolve" and not is_open:
+            die(f"no open incident {slug} in the ledger")
+        line = ev(slug, "incident.opened", what=words(args[2]), sev=sev, by=actor()) if args[0] == "open" else ev(slug, "incident.resolved", by=actor())
+        return [line], [], f"xs: incident {slug} {args[0]}", None
+    txn(prepare)
+    print(f"incident {slug} {'opened' if args[0] == 'open' else 'resolved'}")
+
+
+def cmd_void(args):
+    """The log only grows: a wrong event is cancelled by a later one that names it. flow and xs skip both."""
+    if len(args) != 4 or not re.match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$", args[2]):
+        die('usage: xs void <subject> <kind> <at of the wrong event, as in the log> "reason"')
+    subj, kind, at, reason = args
+
+    def prepare():
+        if not any(e["subj"] == subj and e["kind"] == kind and e["at"] == at for e in events()):
+            die(f"no event {subj} {kind} at {at} in the ledger")
+        return [ev(subj, "event.voided", of_kind=kind, of_at=at, reason=words(reason), by=actor())], [], f"xs: void {subj} {kind}", None
+    txn(prepare)
+    print(f"voided {subj} {kind} {at}")
+
+
+# --- the view -----------------------------------------------------------------------------------------------------
+
+def cmd_status(args):
+    """The ledger as text: what agents and people read instead of a status line in a file."""
+    st = state()
+    if args == ["--unlanded"]:
+        for t, d in sorted(st.items()):
+            if re.match(r"T\d+$", t) and d.get("status") == "closed":
+                last = d["last"]
+                why = f"ejected, {last['kv'].get('reason')}" if last["kind"] == "land.ejected" else "waiting for the integrator, or not delivered"
+                print(f"{t} closed on {d.get('branch', '?')}: {why}")
+        return
+    if len(args) == 2 and args[0] == "--since":  # the report: what changed since the last one
+        since = args[1] if "T" in args[1] else args[1] + "T00:00:00Z"
+        for e in events():
+            if e["at"] >= since:
+                print(e["line"].replace(f" {scope()} ", " ", 1))
+        return
+    if len(args) == 1:
+        i = args[0]
+        files = glob.glob(lpath("tasks", f"{i}-*.md")) + glob.glob(lpath("learnings", f"{i}-*.md")) + \
+            glob.glob(f"project/specs/{i}-*.md") + glob.glob(f"project/adr/{i.replace('ADR-', '')}-*.md" if i.startswith("ADR-") else "")
+        d = st.get(i, {})
+        print(f"{i}: {d.get('status') or (spec_status(i) if re.match(r'S\d+$', i) else 'no events')}"
+              + "".join(f", {k} {d[k]}" for k in ("branch", "built", "amended") if d.get(k)) + "".join(f"\n  {f}" for f in files))
+        for e in events():
+            if e["subj"] == i:
+                print("  " + e["line"])
+        log = lpath("logs", f"{i}.md")
+        if os.path.exists(log):
+            print(f"Log ({log}):\n" + open(log).read().rstrip())
+        return
+    if args:
+        die("usage: xs status [T12|S03|ADR-0007|L02] | --unlanded | --since <YYYY-MM-DD or time>")
+    for p in tasks():
+        t, d = ident(p), st.get(ident(p), {})
+        if d.get("status") not in ("done", "dropped"):
+            last = d.get("last", {})
+            flag = f" (ejected: {last['kv'].get('reason')})" if last.get("kind") == "land.ejected" else ""
+            print(f"{t} {d.get('status', '?')}{' on ' + d['branch'] if d.get('branch') and d.get('status') != 'todo' else ''}{flag} "
+                  f"{get(p, 'priority')} {get_line(p, 'title')}")
+            for run, e in sorted(d.get("agents", {}).items(), key=lambda r: r[1]["at"]):
+                kv = e["kv"]
+                if e["kind"] == "agent.started":
+                    print(f"  agent {run} running since {e['at']}" + "".join(f", {kv[k]}" for k in ("role", "tool", "model", "effort") if kv.get(k)))
+                elif e["kind"] == "agent.stopped":
+                    print(f"  agent {run} stopped at {e['at']}: {kv.get('reason')}" + (f", resumes at {kv['resume_at']}" if kv.get("resume_at") else "")
+                          + (f" (job {kv['job']})" if kv.get("job") else (", no resume scheduled" if kv.get("reason") == "limit" else "")))
+    for f in sorted(glob.glob("project/specs/S*-*.md")):
+        print(f"{ident(f)} {spec_status(ident(f))}")
+    for f in sorted(glob.glob("project/adr/[0-9][0-9][0-9][0-9]-*.md")):
+        d = st.get(f"ADR-{ident(f)}", {})
+        print(f"ADR-{ident(f)} {d.get('status', 'no events')}" + "".join(f", {k} {d[k]}" for k in ("built", "amended") if d.get(k)))
+    for p in entries("proposed") + entries("stale"):
+        print(f"{ident(p)} {status_of(ident(p))} {get(p, 'kind')} to {get(p, 'to')}")
+
+
+# --- memory -------------------------------------------------------------------------------------------------------
+
+DEST = {"rule": "AGENTS.md", "design": "DESIGN.md", "knowledge": "CONTEXT.md"}
+ELSEWHERE = {"preference": "write it in your person's preferences: the only entry an agent writes directly",
+             "decision": "a decision is the owner's: xs ask", "idea": "xs idea", "status": "status lives in a task: xs file"}
+
+
+def learning(lid):
+    hits = glob.glob(lpath("learnings", f"{lid}-*.md"))
+    if len(hits) != 1:
+        die(f"{lid}: no single entry in {lpath('learnings')}")
+    return hits[0]
+
+
+def text_of(path):
+    _, m = front(path)
+    return open(path).read()[m.end():].split("\n## ")[0].strip()
+
+
+def cmd_idea(args):
+    source = opt(args, "--source", "owner")
+    if len(args) != 1:
+        die('usage: xs idea [--source TEXT] "idea"')
+
+    def prepare():
+        with open(lpath("IDEAS.md"), "a") as f:
+            f.write(f"- {dt.date.today().isoformat()} {args[0]} ({source})\n")
+        return [ev("-", "idea.recorded", by=actor())], ["IDEAS.md"], "xs: idea", None
+    txn(prepare)
+    print(f"recorded in {lpath('IDEAS.md')}")
+
+
+def cmd_propose(args):
+    kind, anchor, evidence = opt(args, "--kind"), opt(args, "--anchor"), opt(args, "--evidence")
+    to, sc, old = opt(args, "--to", DEST.get(kind, "")), opt(args, "--scope", ""), opt(args, "--replaces")
+    if old and status_of(old) != "stale":
+        die(f"{old} is {status_of(old) or 'unknown'}: --replaces takes a stale entry")
+    if kind in ELSEWHERE:
+        die(f"a {kind} is not proposed: {ELSEWHERE[kind]}")
+    if kind not in DEST or not anchor or not evidence or len(args) != 1:
+        die('usage: xs propose --kind rule|design|knowledge --anchor PATH --evidence TEXT [--to FILE] [--scope S] [--replaces L3] "entry"')
+    slug = "-".join(re.findall(r"[a-z0-9]+", args[0].lower())[:6]) or "entry"
+
+    def prepare():
+        lid = next_id("learnings", "L")
+        path = lpath("learnings", f"{lid}-{slug}.md")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "w").write(f"---\nkind: {kind}\nto: {to}\nscope: {sc or scope()}\nanchor: {anchor}\n"
+                              f"{'replaces: ' + old + chr(10) if old else ''}created: {dt.date.today().isoformat()}\n---\n\n{args[0]}\n\n## Evidence\n\n- {evidence}\n")
+        line = ev(lid, "learning.proposed", status="proposed", type=kind, to=to, anchor=anchor, by=actor(), **({"replaces": old} if old else {}))
+        return [line], [rel(path)], f"xs: propose {lid}", (lid, path)
+    lid, path = txn(prepare)
+    print(f"{lid} {path}: proposed to the owner of {to}")
+
+
+def mark(path, lid, new):
+    """Rewrite or remove the line marked (lid) in a destination file; return True if found."""
+    if not os.path.exists(path):
+        return False
+    lines = open(path).read().split("\n")
+    hit = [i for i, l in enumerate(lines) if re.search(rf"\({lid}[,)]", l)]
+    for i in reversed(hit):
+        if new is None:
+            del lines[i]
+        else:
+            lines[i] = re.sub(rf"\({lid}[,)].*$", new, lines[i])
+    open(path, "w").write("\n".join(lines))
+    return bool(hit)
+
+
+def write_dest(path, lid, text):
+    if not os.path.exists(path):
+        open(path, "w").write(f"# {os.path.splitext(os.path.basename(path))[0].title()}\n\n")
+    lines = open(path).read().rstrip("\n").split("\n")
+    nums = [i for i, l in enumerate(lines) if re.match(r"\d+\. ", l)]
+    if nums:  # a numbered rules file: the next number, after the last rule
+        n = int(re.match(r"(\d+)", lines[nums[-1]]).group(1)) + 1
+        lines.insert(nums[-1] + 1, f"{n}. {text} ({lid})")
+    else:
+        lines.append(f"- {text} ({lid})")
+    open(path, "w").write("\n".join(lines) + "\n")
+
+
+def cmd_promote(args):
+    if len(args) != 1:
+        die("usage: xs promote L3")
+    lid, path = args[0], learning(args[0])
+    to = get(path, "to")
+
+    def prepare():
+        status = status_of(lid)
+        if status not in ("proposed", "stale"):
+            die(f"{lid} is {status}: only a proposed or stale entry is promoted")
+        lines, files, old = [ev(lid, "learning.promoted", status="promoted", to=to, by=actor())], [rel(path)], get(path, "replaces")
+        if old and status_of(old) not in ("checked", "retired"):  # the amended text takes the place of the stale entry
+            op = learning(old)
+            mark(get(op, "to"), old, None)
+            with open(op, "a") as f:
+                f.write(f"\nRetired: replaced by {lid}\n")
+            lines.append(ev(old, "learning.retired", status="retired", by=actor(), replaced_by=lid))
+            files.append(rel(op))
+        return lines, files, f"xs: promote {lid}", status
+    status = txn(prepare)
+    if status == "proposed":  # on main, after the ledger: a retried prepare would write it twice
+        write_dest(to, lid, text_of(path))
+    else:
+        mark(to, lid, f"({lid})")
+    print(f"{lid} promoted: commit {to} on main")
+
+
+def unload(args, kind, status, label):
+    if len(args) != 2:
+        die(f'usage: xs {sys.argv[1]} L3 "{label.lower()}"')
+    lid, path = args[0], learning(args[0])
+
+    def prepare():
+        if status_of(lid) in ("checked", "retired"):
+            die(f"{lid} is already {status_of(lid)}")
+        mark(get(path, "to"), lid, None)
+        with open(path, "a") as f:
+            f.write(f"\n{label}: {args[1]}\n")
+        return [ev(lid, kind, status=status, by=actor())], [rel(path)], f"xs: {status} {lid}", None
+    txn(prepare)
+    print(f"{lid} {status}: commit {get(path, 'to')} on main")
+
+
+def cmd_recommend(args):
+    if len(args) != 3 or args[1] not in ("holds", "retire"):
+        die('usage: xs recommend L3 holds|retire "why"')
+    lid, path = args[0], learning(args[0])
+
+    def prepare():
+        if status_of(lid) != "stale":
+            die(f"{lid} is {status_of(lid)}: only a stale entry takes a recommendation")
+        with open(path, "a") as f:
+            f.write(f"\nRecommended ({dt.date.today().isoformat()}): {args[1]}, {args[2]}\n")
+        return [ev(lid, "learning.recommended", rec=args[1], by=actor())], [rel(path)], f"xs: recommend {lid}", None
+    txn(prepare)
+    print(f"{lid}: recommended {args[1]}")
+
+
+def cmd_repeated(args):
+    if len(args) != 2:
+        die('usage: xs repeated L3 "quote of the correction"')
+    path = learning(args[0])
+
+    def prepare():
+        with open(path, "a") as f:
+            f.write(f"- {dt.date.today().isoformat()}, repeated: {args[1]}\n")
+        return [ev(args[0], "correction.repeated", by=actor())], [rel(path)], f"xs: {args[0]} repeated", None
+    txn(prepare)
+    print(f"{args[0]}: repeated")
+
+
+def entries(status=None):
+    return [p for p in sorted(glob.glob(lpath("learnings", "L*-*.md"))) if status is None or status_of(ident(p)) == status]
+
+
+def cmd_queue(args):
+    for p in tasks():
+        if get(p, "type") == "decision" and status_of(ident(p)) in ("todo", "doing", "blocked"):
+            print(f"{ident(p)} question {get_line(p, 'created')} {get_line(p, 'title')}")
+    for p in entries("proposed") + entries("stale"):
+        rec = re.findall(r"^Recommended \(.*?\): (.*)$", open(p).read(), re.M) if status_of(ident(p)) == "stale" else []
+        extra = (f" (replaces {get(p, 'replaces')})" if get(p, "replaces") else "") + (f" [recommended: {rec[-1]}]" if rec else "")
+        print(f"{ident(p)} {status_of(ident(p))} {get(p, 'kind')} to {get(p, 'to')}{extra}: {text_of(p)[:80]}")
+
+
+def stale_marks(base, cwd):
+    """Promoted entries whose anchor changed between base and HEAD in cwd: their line in the destination, under cwd,
+    is marked stale. Returns the events to record once the change is on main."""
+    changed = git("-C", cwd, "diff", "--name-only", f"{base}...HEAD").splitlines()
+    lines, touched = [], set()
+    for p in entries("promoted"):
+        anchor = get(p, "anchor").rstrip("/")
+        m = re.match(r"(S\d+|ADR-(\d{4}))$", anchor)
+        prefix = (f"project/specs/{anchor}-" if m and not m.group(2) else f"project/adr/{m.group(2)}-") if m else None
+        hit = next((c for c in changed if (c.startswith(prefix) if prefix else c == anchor or c.startswith(anchor + "/"))), None)
+        if not hit:
+            continue
+        lid, to = ident(p), get(p, "to")
+        mark(os.path.join(cwd, to), lid, f"({lid}, stale: {hit} changed)")
+        touched.add(to)
+        lines.append(ev(lid, "learning.stale", status="stale", anchor=hit, by="land"))
+    return lines, sorted(touched)
+
+
+def cmd_stale(args):
+    """Entries whose anchor this branch changed: stale until a person confirms them (xs promote)."""
+    if len(args) != 1:
+        die("usage: xs stale MAIN")
+    lines, touched = stale_marks(args[0], os.getcwd())
+    if lines:
+        txn(lambda: (lines, [], "xs: stale entries", None))
+    for f in touched:
+        print(f)
+
+
+def person_log():
+    d = os.environ.get("XS_HOME") or os.path.expanduser("~/.xs")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "events.log")
+
+
+def recalled(ids, via):
+    with open(person_log(), "a") as f:
+        for i in ids:
+            f.write(f"{now()} {scope()} {i} learning.recalled via={via} session={os.environ.get('XS_SESSION', '-')} by={actor()}\n")
+
+
+def cmd_load(args):
+    ids = [ident(p) for p in entries("promoted")]
+    recalled(ids, "load")
+    print(f"loaded {len(ids)} entries")
+
+
+def cmd_search(args):
+    # ponytail: word overlap, no meaning; replace the scoring with a semantic index behind this same command
+    if len(args) != 1:
+        die('usage: xs search "words"')
+    terms = {w for w in re.findall(r"\w{3,}", args[0].lower())}
+    files = [f for g in ("project/specs/*.md", "project/adr/*.md", lpath("tasks", "T*.md"), lpath("learnings", "L*.md"),
+                         lpath("logs", "*.md"), lpath("IDEAS.md"), "AGENTS.md", "DESIGN.md", "CONTEXT.md", "ARCHITECTURE.md")
+             for f in glob.glob(g)]
+    hits = []
+    for f in files:
+        body = open(f).read().lower()
+        score = sum(body.count(w) for w in terms)
+        if score:
+            hits.append((score, f))
+    hits.sort(key=lambda h: (-h[0], h[1]))
+    learn = lpath("learnings")
+    for score, f in hits[:10]:
+        tag = f" [{status_of(ident(f))}]" if f.startswith(learn) else ""
+        print(f"{score:3d} {f}{tag}")
+    recalled([ident(f) for _, f in hits[:10] if f.startswith(learn)], "search")
+
+
+DELETED = "\0deleted"
+
+
+def cmd_import_git(args):
+    """filed, closed, dropped and landed from history; ADRs proposed, accepted and retired. Run once, then never sync.
+    An exit counts as much as a birth: a file removed (an ADR rejected or merged, a task deleted) or a task
+    dropped closes its entry, or flow would report it waiting for ever."""
+    dry = "--dry-run" in args
+    if any(" src=git" in e["line"] for e in events()):
+        die("already imported: the ledger holds src=git events")
+    main, found, seen = os.environ.get("MAIN", "main"), [], {}
+
+    def walk(*extra):
+        # the diff --git header is there even for an empty file, unlike the ---/+++ lines. A rename git does not
+        # detect (a new name and new content in one commit) reads as a deletion plus an addition: a deletion is an
+        # exit only if no file with the same id exists once the commit is over
+        def ident(p):
+            m = re.search(r"/(T\d+|\d{4})-", p)
+            return m.group(1) if m else p
+        cur = at = None
+        touched, gone = set(), []
+        def flush():
+            alive = {ident(p) for p in touched - set(gone)}
+            for p in gone:
+                if ident(p) not in alive:
+                    yield at, p, DELETED
+        for line in git("log", "--reverse", "-M", "--format=C %cI", "-p", "-U0", *extra, "--", "project/tasks", "project/adr").splitlines():
+            if line.startswith("C "):
+                yield from flush()
+                at, touched, gone = utc(line[2:]), set(), []
+            elif line.startswith("diff --git "):
+                cur = re.match(r"diff --git a/\S+ b/(\S+)", line).group(1)
+                touched.add(cur)
+                yield at, cur, None
+            elif line.startswith("deleted file mode") and cur:
+                gone.append(cur)
+                cur = None
+            elif cur and line.startswith("+") and not line.startswith("+++"):
+                yield at, cur, line[1:]
+        yield from flush()
+
+    for at, f, line in walk():
+        m = re.match(r"project/tasks/(T\d+)-.*\.md$", f or "") or re.match(r"project/adr/(\d{4})-.*\.md$", f or "")
+        if not m:
+            continue
+        subj = m.group(1) if f.startswith("project/tasks") else f"ADR-{m.group(1)}"
+        task = f.startswith("project/tasks")
+        if line == DELETED and (subj, "end") not in seen:
+            seen[(subj, "end")] = 1
+            found.append((at, subj, "task.dropped" if task else "adr.retired", ("status=dropped " if task else "") + "reason=removed"))
+        elif line == DELETED:
+            continue
+        elif line is not None and task and re.match(r"status:\s*dropped\b", line) and (subj, "end") not in seen:
+            seen[(subj, "end")] = 1
+            found.append((at, subj, "task.dropped", "status=dropped"))
+        elif line is None and (subj, "new") not in seen:
+            seen[(subj, "new")] = 1
+            kv = ""
+            if task and os.path.exists(f):  # type and priority as the file states them now: git kept no history of intent
+                fm = re.match(r"---\n(.*?\n)---", open(f).read(), re.S)
+                kv = " ".join(f"{k}={v}" for k, v in re.findall(r"^(type|priority):[ \t]*([^\s#]+)", fm.group(1) if fm else "", re.M))
+            found.append((at, subj, "task.filed" if task else "adr.proposed", ("status=todo " + kv).strip() if task else ""))
+        elif line is not None and task and re.match(r"status:\s*(done|merged)\b", line) and (subj, "closed") not in seen:
+            seen[(subj, "closed")] = 1
+            found.append((at, subj, "task.closed", "status=done"))
+        elif line is not None and not task and re.match(r"(status:\s*)?(proposed|accepted)\b", line, re.I) \
+                and re.search(r"(^|[,;.]\s*|status:\s*)accepted\b", line, re.I) and (subj, "acc") not in seen:
+            # only the header line, in any case: "Accepted on …", "Proposed on …, accepted by …"; never the body
+            seen[(subj, "acc")] = 1
+            found.append((at, subj, "adr.accepted", ""))
+    for at, f, line in walk("--first-parent", "-m", main):
+        m = re.match(r"project/tasks/(T\d+)-.*\.md$", f)
+        if m and line is not None and re.match(r"status:\s*(done|merged)\b", line) and (m.group(1), "landed") not in seen:
+            seen[(m.group(1), "landed")] = 1
+            found.append((at, m.group(1), "landed", f"on={main}"))
+    sc = scope()
+    lines = [f"{at} {sc} {subj} {kind} {kv} src=git".replace("  ", " ") + "\n"
+             for at, subj, kind, kv in sorted(found, key=lambda e: e[0])]  # stable: closed before landed
+    if dry:
+        sys.stdout.write("".join(lines))
+        return
+    txn(lambda: (lines, [], "xs: import the events git can date", None))
+    print(f"imported {len(found)} events into the ledger; starts are not in git, so cycle time begins with xs start")
+
+
+def cmd_integrate(args):
+    """The integrator: the only process that moves main. Workers deliver with land and go on writing code.
+
+    xs integrate                                   take every branch in the queue onto main, until it is empty
+    xs integrate --deliver BRANCH WORKTREE KEEP    land's half: queue the branch, then wait for its outcome
+    xs integrate --deliver ... --queue             queue it, start an integrator if none runs, return at once
+
+    A round puts every queued branch, in order, on top of main in a worktree of its own. A branch that conflicts
+    is ejected. CHECK_GATE (default: make check) runs once on the whole round. Green: main moves to it by
+    fast-forward, a compare-and-swap that fails if main moved meanwhile, and the round is rebuilt (three times
+    at most). Red: the first half is tried alone and the rest waits for the next round, down to the one branch
+    that fails, which is ejected with its log. An ejected branch stays as it was; land.ejected records why.
+    Queue, outcomes, logs and the lock live in the git dir, never in the repo."""
+    common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
+    qdir, lock = os.path.join(common, "xs-queue"), os.path.join(common, "xs-integrate.lock")
+    done, logs = os.path.join(qdir, "done"), os.path.join(qdir, "logs")
+    os.makedirs(done, exist_ok=True)
+    os.makedirs(logs, exist_ok=True)
+    main = os.environ.get("MAIN", "main")
+    gate = os.environ.get("CHECK_GATE") or os.environ.get("CHECK") or "make check"
+    main_wt = re.match(r"worktree (.+)", git("worktree", "list", "--porcelain")).group(1)
+    tw = os.path.join(main_wt, ".xs", "worktrees", "_integrate")
+    if git("-C", main_wt, "branch", "--show-current") != main:
+        die(f"{main_wt} is not on {main}: the integrator moves {main} there, and leaves it alone")
+    say = lambda m: print(f"land: {m}", flush=True)
+
+    def log_events(lines, msg):
+        """A ledger that cannot be written must not stop the round once main moved, or the branch would land twice
+        and land would wait for ever: the events wait in the git dir, and the next xs command writes them."""
+        try:
+            txn(lambda: (lines, [], msg, None))
+        except SystemExit as e:
+            subprocess.run(["git", "-C", ledger(), "checkout", "HEAD", "--", LOG], capture_output=True)
+            open(unrecorded(), "a").writelines(lines)
+            say(f"the ledger refused the events ({e}); the next xs command writes them")
+
+    def acquire():
+        try:
+            os.mkdir(lock)
+        except FileExistsError:
+            try:
+                pid = int(open(os.path.join(lock, "pid")).read())
+                os.kill(pid, 0)
+                return False
+            except (OSError, ValueError):  # the holder died: take the lock over
+                subprocess.run(["rm", "-rf", lock])
+                return acquire()
+        open(os.path.join(lock, "pid"), "w").write(str(os.getpid()))
+        return True
+
+    def queued():
+        out = []
+        for name in sorted(os.listdir(qdir)):
+            p = os.path.join(qdir, name)
+            if re.match(r"\d+-", name) and os.path.isfile(p):
+                branch, wt, keep = open(p).read().split("\n")[:3]
+                out.append(dict(file=p, branch=branch, wt=wt, keep=keep == "keep"))
+        return out
+
+    def run(*a, cwd=tw):
+        return subprocess.run(["git", "-C", cwd, *a], capture_output=True, text=True)
+
+    def outcome(e, text):
+        open(os.path.join(done, e["branch"]), "w").write(text)
+        os.remove(e["file"])
+
+    def tasks_closed(branch):
+        """The tasks closed on this branch and not yet landed: their state is in the ledger, never in the branch."""
+        global _state
+        _state = None
+        return sorted((t for t, d in state().items() if re.match(r"T\d+$", t) and d.get("status") == "closed" and d.get("branch") == branch),
+                      key=lambda t: int(t[1:])) or ["-"]
+
+    def reset():
+        if not os.path.isdir(tw):
+            git("worktree", "add", "-q", "--detach", tw, main)
+        run("reset", "-q", "--hard", main)
+        run("clean", "-qfd")  # untracked build caches in ignored folders stay: the next round compiles less
+
+    def eject(e, reason, detail):
+        lines = [ev(t, "land.ejected", branch=e["branch"], reason=reason, by="land") for t in tasks_closed(e["branch"])]
+        log_events(lines, f"land: eject {e['branch']} ({reason})")
+        outcome(e, f"ejected {reason}\n{detail}\n")
+        say(f"ejected {e['branch']}: {reason}. {detail}")
+
+    def round_(entries):
+        reset()
+        base, picked = run("rev-parse", "HEAD").stdout.strip(), []
+        for e in entries:
+            before = run("rev-parse", "HEAD").stdout.strip()
+            commits = git("rev-list", "--reverse", "--no-merges", f"{main}..{e['branch']}").split()
+            r = run("cherry-pick", "--allow-empty", "--keep-redundant-commits", *commits) if commits else None
+            if r is not None and r.returncode:
+                files = run("diff", "--name-only", "--diff-filter=U").stdout.split() or ["see git rebase " + main]  # before the abort clears them
+                run("cherry-pick", "--abort")
+                run("reset", "-q", "--hard", before)
+                eject(e, "conflict", f"rebase {e['branch']} on {main} and resolve: {' '.join(files)}")
+                return True
+            picked.append(e)
+        if not picked:
+            return True
+        logf = os.path.join(logs, f"gate-{time_ns()}.log")
+        say(f"{gate}, on {' '.join(e['branch'] for e in picked)}")
+        green = subprocess.run(["bash", "-c", gate], cwd=tw, stdout=open(logf, "w"), stderr=subprocess.STDOUT).returncode == 0
+        if not green:
+            if len(picked) == 1:
+                eject(picked[0], "red", f"the gate failed: {logf}")
+                return True
+            return round_(picked[:len(picked) // 2])  # the rest waits for the next round
+        stale, touched = stale_marks(base, tw)  # memory entries whose anchor the round changed: their mark is content, on main
+        if touched:
+            run("add", "--", *touched)
+            run("commit", "-q", "-m", "land: mark stale entries", "--", *touched)
+        r = run("merge", "--ff-only", "-q", run("rev-parse", "HEAD").stdout.strip(), cwd=main_wt)
+        if r.returncode:
+            return False  # main moved under the round: rebuild it
+        head = git("rev-parse", "--short", main)
+        lines = [ev(t, "landed", status="done" if t != "-" else None, on=main, commit=head, branch=e["branch"], by="land")
+                 for e in picked for t in tasks_closed(e["branch"])]
+        log_events(lines + stale, "land: " + " ".join(e["branch"] for e in picked))  # main has moved: never stop here
+        for e in picked:
+            note = ""
+            if e["keep"]:  # the chain goes on from what landed, or its next delivery would repeat these commits
+                if not run("status", "--porcelain", cwd=e["wt"]).stdout:
+                    run("reset", "-q", "--hard", main, cwd=e["wt"])
+            elif os.path.isdir(e["wt"]) and run("worktree", "remove", e["wt"], cwd=main_wt).returncode == 0:
+                run("branch", "-D", "-q", e["branch"], cwd=main_wt)
+                note = f"; removed {e['wt']} and {e['branch']}"
+            outcome(e, f"landed {head}{note}\n")
+            say(f"{main} is now {head}, {e['branch']} landed{note}")
+        return True
+
+    if "--deliver" in args:
+        i = args.index("--deliver")
+        branch, wt, keep = args[i + 1:i + 4]
+        open(os.path.join(qdir, f"{time_ns()}-{branch.replace('/', '_')}"), "w").write(f"{branch}\n{wt}\n{keep}\n")
+        result = os.path.join(done, branch)
+        if os.path.exists(result):
+            os.remove(result)
+        if "--queue" in args:
+            if not os.path.exists(lock):
+                subprocess.Popen([os.path.abspath(__file__), "integrate"], cwd=main_wt, start_new_session=True,
+                                 stdout=open(os.path.join(logs, "integrate.log"), "a"), stderr=subprocess.STDOUT)
+            say(f"{branch} queued: the integrator lands it; its outcome goes to the log and to {result}")
+            return
+        while not os.path.exists(result):  # wait: integrate if no one does, or let the integrator work
+            if acquire():
+                try:
+                    integrate_all(queued, round_, say)
+                finally:
+                    subprocess.run(["rm", "-rf", lock])
+            else:
+                import time
+                time.sleep(1)
+        text = open(result).read()
+        if not text.startswith("landed"):
+            print(text.strip(), file=sys.stderr)
+            sys.exit(1)
+        return
+    while acquire():  # after the lock is released, a branch queued meanwhile would wait for ever: look again
+        try:
+            integrate_all(queued, round_, say)
+        finally:
+            subprocess.run(["rm", "-rf", lock])
+        if not queued():
+            break
+
+
+def integrate_all(queued, round_, say):
+    misses = 0
+    while queued():
+        if round_(queued()):
+            misses = 0
+        else:
+            misses += 1
+            if misses == 3:
+                die("main kept moving under the round, or its worktree has changes the fast-forward would overwrite")
+
+
+def time_ns():
+    import time
+    return time.time_ns()
+
+
+ADR_STATE = re.compile(r"^(Proposed|Accepted|Retired|Rejected|Superseded)\b|^(Built|Amended by):")
+
+
+def cmd_migrate(args):
+    """Once, in a repo that kept its tracker on main: move EVENTS.log, tasks, learnings and IDEAS.md to the ledger
+    without their state lines, move each spec's Log to logs/, remove the state lines of specs and ADRs, and record a
+    migrated event wherever a file's state differed from its events. The changes on main are left to commit."""
+    main = os.environ.get("MAIN", "main")
+    if args or git("branch", "--show-current") != main or os.path.realpath(os.getcwd()) != os.path.realpath(main_wt()):
+        die(f"usage: xs migrate, on {main} in the main worktree")
+    old = [p for p in ("project/EVENTS.log", "project/tasks", "project/learnings", "project/IDEAS.md") if os.path.exists(p)]
+    if not old and not glob.glob("project/specs/S*-*.md") and not glob.glob("project/adr/[0-9]*-*.md"):
+        die("nothing to migrate: project/ holds no EVENTS.log, tasks, learnings, IDEAS.md, specs or ADRs")
+    onmain = {}  # the rewritten specs and ADRs: written after the ledger's commit, since a retry runs prepare again
+    old_text = open("project/EVENTS.log").read() if os.path.exists("project/EVENTS.log") else ""
+    before = state_of(events(old_text))
+    has = lambda i: before.get(i, {}).get("status", "")
+    VOCAB = {"task": ("todo", "doing", "blocked", "closed", "done", "dropped"),
+             "learning": ("proposed", "promoted", "stale", "checked", "retired")}
+
+    def strip_state(text, keys):
+        m = re.match(r"---\n(.*?\n)---\n", text, re.S)
+        if not m:
+            return text, {}
+        found = dict(re.findall(rf"^({'|'.join(keys)}):[ \t]*([^\s#]*)", m.group(1), re.M))
+        fm = re.sub(rf"^({'|'.join(keys)}):.*\n", "", m.group(1), flags=re.M)
+        return "---\n" + fm + "---\n" + text[m.end():], found
+
+    def prepare():
+        if events():  # after the pull: a teammate may have migrated already
+            die("the ledger already holds events: migrate runs once")
+        onmain.clear()
+        extra, paths, n = [], [], {"tasks": 0, "learnings": 0, "specs": 0, "adrs": 0, "migrated": 0}
+        for kind, folder, prefix in (("task", "tasks", "T"), ("learning", "learnings", "L")):
+            for f in sorted(glob.glob(f"project/{folder}/*")):
+                name = os.path.basename(f)
+                dst = lpath(folder, name)
+                if name == "RESERVED":
+                    continue  # one ledger hands out the numbers: no ranges
+                if os.path.isdir(f):  # an archive, kept as it was
+                    shutil.copytree(f, dst, dirs_exist_ok=True)
+                    paths.append(rel(dst))
+                    continue
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                if not re.match(rf"{prefix}\d+-.*\.md$", name):
+                    shutil.copy(f, dst)  # a README or a saved patch
+                    paths.append(rel(dst))
+                    continue
+                text, found = strip_state(open(f).read(), ("status", "branch", "closed", "blocked_reason"))
+                open(dst, "w").write(text)
+                paths.append(rel(dst))
+                n[folder] += 1
+                i, st = ident(f), found.get("status", "")
+                st = "done" if kind == "task" and st in ("merged", "closed") else st  # on main: it landed
+                was = None
+                if st not in VOCAB[kind] and not has(i):  # missing or outside the vocabulary: it starts over, the old word kept
+                    st, was = ("todo" if kind == "task" else "proposed"), (words(st) or "none")
+                if st in VOCAB[kind] and st != has(i):
+                    extra.append(ev(i, f"{kind}.migrated", status=st, branch=found.get("branch") or None, was=was, src="migrate"))
+        if os.path.exists("project/IDEAS.md"):
+            shutil.copy("project/IDEAS.md", lpath("IDEAS.md"))
+            paths.append("IDEAS.md")
+        for f in sorted(glob.glob("project/specs/S*-*.md")):
+            text, found = strip_state(open(f).read(), ("status",))
+            sid = ident(f)
+            m = re.search(r"^## Log[ \t]*\n(.*?)(?=^## |\Z)", text, re.M | re.S)
+            if m:
+                log = [l for l in m.group(1).splitlines() if l.strip()]
+                text = (text[:m.start()].rstrip("\n") + "\n" + ("\n" + text[m.end():] if text[m.end():].strip() else "")).rstrip("\n") + "\n"
+                if log:
+                    dst = lpath("logs", f"{sid}.md")
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    open(dst, "w").write("\n".join(log) + "\n")
+                    paths.append(rel(dst))
+                approved = {e["kv"].get("by", "").lower() for e in events(old_text) if e["subj"] == sid and e["kind"] == "spec.approved"}
+                for who in re.findall(r"approved by ([^\s:,.]+):", "\n".join(log), re.I):  # the form xs writes; "approved by that direction" is prose
+                    if who.lower() not in approved:
+                        approved.add(who.lower())
+                        extra.append(ev(sid, "spec.approved", by=who, src="migrate"))
+            onmain[f] = text
+            n["specs"] += 1
+            st = found.get("status", "")
+            if st in ("draft", "ready", "done", "dropped") and st != (has(sid) or "draft"):
+                extra.append(ev(sid, "spec.migrated", status=st, src="migrate"))
+        for f in sorted(glob.glob("project/adr/[0-9][0-9][0-9][0-9]-*.md")):
+            lines = open(f).read().split("\n")
+            end = next((i for i, l in enumerate(lines) if l.startswith("## ")), len(lines))
+            head = [l for l in lines[1:end] if ADR_STATE.match(l)]
+            if not head:
+                continue
+            sid, st, built, amended = f"ADR-{ident(f)}", "", "", ""
+            for l in head:
+                k = ADR_STATE.match(l)
+                if k.group(1):
+                    st = k.group(1).lower()
+                elif k.group(2) == "Built":
+                    built = words(l.split(":", 1)[1])
+                else:
+                    amended = words(l.split(":", 1)[1])
+            keep = lines[:1] + [l for l in lines[1:end] if not ADR_STATE.match(l)] + lines[end:]
+            onmain[f] = re.sub(r"\n{3,}", "\n\n", "\n".join(keep))
+            n["adrs"] += 1
+            d = before.get(sid, {})
+            if (st and st != d.get("status")) or (built and built != d.get("built")) or (amended and amended != d.get("amended")):
+                extra.append(ev(sid, "adr.migrated", status=st or None, built=built or None, amended=amended or None, src="migrate"))
+        n["migrated"] = len(extra)
+        lines = [l if l.endswith("\n") else l + "\n" for l in old_text.splitlines(keepends=True)] + extra
+        return lines, paths, "xs: migrate the ledger from main", n
+    n = txn(prepare)
+    for f, text in onmain.items():
+        open(f, "w").write(text)
+    if old:
+        git("rm", "-r", "-q", "--", *old)
+    if os.path.exists(".gitattributes"):
+        keep = [l for l in open(".gitattributes").read().splitlines() if not re.match(r"project/(EVENTS\.log|tasks/RESERVED)\s", l)]
+        open(".gitattributes", "w").write("".join(l + "\n" for l in keep))
+    print(f"moved {n['tasks']} tasks and {n['learnings']} entries to {ledger()} (branch {LEDGER}); "
+          f"moved the Log of {n['specs']} specs; removed the state lines of {n['adrs']} ADRs; {n['migrated']} migrated events.\n"
+          f"Review the diff on {main}, then commit it: git commit -am \"Move the ledger off main\"")
+
+
+
+def tools(home):
+    """The adapters whose tool is installed in HOME. ponytail: one adapter today; a manifest per adapter when a second one needs files."""
+    return [t for t, d in [("claude-code", ".claude")] if os.path.isdir(os.path.join(home, d))]
+
+
+def cmd_install(args, here):
+    """Link the skills into the agent tools found in HOME, and apply each tool's adapter. Run again, it changes nothing."""
+    xs, home = os.path.dirname(here), os.path.expanduser("~")
+    dirs = [d for d in [opt(args, "--skills-dir")] if d]
+    claude = os.path.join(home, ".claude") if "claude-code" in tools(home) else None
+    if claude:
+        dirs.append(os.path.join(claude, "skills"))
+    if os.path.isdir(os.path.join(home, ".agents")) or os.path.isdir(os.path.join(home, ".codex")):
+        dirs.append(os.path.join(home, ".agents", "skills"))  # the tools that read the open standard from ~/.agents
+    if not dirs:
+        die("no agent tool found in ~: pass --skills-dir <your tool's skills folder>")
+    adapter = os.path.join(xs, "adapters", "claude-code")
+    links = [(os.path.join(xs, "skills", n), os.path.join(d, n)) for d in dirs
+             for n in sorted(os.listdir(os.path.join(xs, "skills"))) if os.path.exists(os.path.join(xs, "skills", n, "SKILL.md"))]
+    if claude:  # the role definitions of the adapter
+        links += [(os.path.join(adapter, "agents", n), os.path.join(claude, "agents", n))
+                  for n in sorted(os.listdir(os.path.join(adapter, "agents"))) if n.endswith(".md")]
+    for src, dst in links:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        if os.path.realpath(dst) == os.path.realpath(src):
+            continue
+        if os.path.lexists(dst):
+            print(f"kept {dst}: it exists and is not XS's; remove it and run xs install again to link it")
+            continue
+        os.symlink(src, dst)
+        print(f"linked {dst}")
+    ours = (os.path.join(xs, "skills") + os.sep, os.path.join(adapter, "agents") + os.sep)
+    for d in set(os.path.dirname(dst) for _, dst in links):  # a link of ours left by a renamed or removed skill
+        for n in os.listdir(d):
+            p = os.path.join(d, n)
+            if os.path.islink(p) and not os.path.exists(p) and os.readlink(p).startswith(ours):
+                os.remove(p)
+                print(f"removed {p}: its target is gone")
+    if claude:  # the adapter's hooks: the guard, and the lifecycle of subagents (xs agent events)
+        path = os.path.join(claude, "settings.json")
+        conf = json.load(open(path)) if os.path.exists(path) else {}
+        hooks, changed = conf.setdefault("hooks", {}), False
+        for event, matcher, name in [("PreToolUse", "Bash|Agent|Task", "guard"), ("PreToolUse", "Agent|Task", "lifecycle"),
+                                     ("SubagentStop", None, "lifecycle")]:
+            have = hooks.setdefault(event, [])
+            ours = [m for m in have if any(h.get("command", "").endswith("/" + name) for h in m.get("hooks", []))]
+            if not ours:
+                have.append({**({"matcher": matcher} if matcher else {}),
+                             "hooks": [{"type": "command", "command": f"python3 {os.path.join(adapter, name)}"}]})
+                print(f"hook {name} on {event} added to {path}")
+            for m in ours:  # an older install guarded Bash only
+                if matcher and m.get("matcher") != matcher:
+                    m["matcher"], changed = matcher, True
+            changed = changed or not ours
+        if changed:
+            json.dump(conf, open(path, "w"), indent=2)
+    if here not in os.environ.get("PATH", "").split(os.pathsep):
+        print(f'add the scripts to PATH: export PATH="{here}:$PATH"')
+
+
+def cmd_init(args, here):
+    """Copy the template into the repo; a file already there is kept, and the two git files get only their missing lines."""
+    xs, made, kept = os.path.dirname(here), [], []
+    sources = [os.path.join(xs, "template")] + [os.path.join(xs, "adapters", t, "template") for t in tools(os.path.expanduser("~"))]
+    for template, d, names in [(t, d, n) for t in sources for d, _, n in os.walk(t)]:
+        if os.path.relpath(d, template).split(os.sep)[0] == "ledger":
+            continue  # the ledger's files go to the ledger, which xs creates below
+        for n in names:
+            if n == ".DS_Store":
+                continue
+            src = os.path.join(d, n)
+            dst = os.path.relpath(src, template)
+            if n == ".gitattributes" and os.path.exists(dst):
+                have = open(dst).read().splitlines()
+                add = [l for l in open(src).read().splitlines() if l and not l.startswith("#") and l not in have]
+                if add:
+                    open(dst, "a").write("".join(l + "\n" for l in add))
+                    made.append(dst + " (lines added)")
+                continue
+            if os.path.exists(dst):
+                kept.append(dst)
+                continue
+            os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+            shutil.copy(src, dst)
+            made.append(dst)
+    ignore = open(".gitignore").read().splitlines() if os.path.exists(".gitignore") else []
+    if ".xs/" not in ignore:
+        open(".gitignore", "a").write(".xs/\n")
+        made.append(".gitignore (.xs/ ignored: the worktrees and the ledger's checkout)")
+    made.append(f"{ledger()} (the ledger, branch {LEDGER})")
+    for f in made:
+        print(f"added {f}")
+    for f in kept:
+        print(f"kept {f}: compare it with XS's in {os.path.join(xs, 'template')} or its adapter")
+    first = ("merge XS's rules into your AGENTS.md (the template is beside xs)" if "AGENTS.md" in kept
+             else "fill each <...> of AGENTS.md: the stack, the commit rules")
+    print(f"""
+next:
+  1. {first}; and give make the targets
+     check-change, check and check-release (or set CHECK_CHANGE, CHECK_GATE, CHECK_RELEASE)
+  2. git add what it added, and commit: "Adopt XS"
+  3. ask your agent for a small change, ending with: "Use the lead skill."
+""")
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return
+    here = os.path.dirname(os.path.realpath(__file__))  # before the chdir: __file__ may be relative
+    if argv[0] == "install":  # outside any repo
+        return cmd_install(argv[1:], here)
+    if argv[0] == "init" and subprocess.run(["git", "rev-parse"], capture_output=True).returncode:
+        die("not a git repo: run git init first")
+    os.chdir(git("rev-parse", "--show-toplevel"))
+    cmd, args = argv[0], argv[1:]
+    {"init": lambda a: cmd_init(a, here),
+     "migrate": cmd_migrate,
+     "status": cmd_status,
+     "file": lambda a: file_task(a, "task.filed"),
+     "ask": lambda a: file_task(a, "question.asked"),
+     "next": cmd_next,
+     "start": cmd_start,
+     "agent": cmd_agent,
+     "sync": cmd_sync,
+     "handoff": cmd_handoff,
+     "takeover": cmd_takeover,
+     "close": lambda a: transition(a, "task.closed", "closed"),
+     "answer": cmd_answer,
+     "block": lambda a: transition(a, "task.blocked", "blocked", need_reason=True),
+     "unblock": lambda a: transition(a, "task.unblocked", ""),
+     "drop": lambda a: transition(a, "task.dropped", "dropped", need_reason=True),
+     "spec": cmd_spec,
+     "review": cmd_review,
+     "reviewed": cmd_reviewed,
+     "import-git": cmd_import_git,
+     "void": cmd_void,
+     "integrate": cmd_integrate,
+     "where": lambda a: os.execv(os.path.join(here, "where"), [os.path.join(here, "where"), *a]),
+     "land": lambda a: os.execv(os.path.join(here, "land"), [os.path.join(here, "land"), *a]),
+     "idea": cmd_idea,
+     "propose": cmd_propose,
+     "promote": cmd_promote,
+     "checked": lambda a: unload(a, "learning.checked", "checked", "Checked by"),
+     "retire": lambda a: unload(a, "learning.retired", "retired", "Retired"),
+     "repeated": cmd_repeated,
+     "recommend": cmd_recommend,
+     "queue": cmd_queue,
+     "stale": cmd_stale,
+     "load": cmd_load,
+     "search": cmd_search,
+     "adr": cmd_adr,
+     "release": cmd_release,
+     "rollback": cmd_rollback,
+     "incident": cmd_incident,
+     }.get(cmd, lambda a: die(f"unknown command {cmd}: xs --help"))(args)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""flow: the core numbers of the method, computed from EVENTS.log on the ledger branch, xs-ledger (PROTOCOL §10). Run in the repo.
+
+  flow [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--prompts N]   the seven core numbers, with coverage
+  flow ... --explain                                            the diagnostics, to explain a number that moved
+  flow --selftest
+
+The period counts what happened inside it: landings, filings, closings. Waiting is measured at --until.
+--prompts takes the owner's prompts of the period from the retrospective's digest (stats.txt): they stay local.
+A number with nothing to measure says so; it is never estimated. Numbers describe the project, never a person.
+"""
+import os, re, subprocess, sys, datetime as dt
+
+LINE = re.compile(r"^(\S+) (\S+) (\S+) (\S+)(.*)$")
+
+
+def parse(text):
+    out = []
+    for line in text.splitlines():
+        m = LINE.match(line)
+        if m:
+            at, scope, subj, kind, rest = m.groups()
+            out.append(dict(at=dt.datetime.fromisoformat(at.replace("Z", "+00:00")), stamp=at, subj=subj, kind=kind,
+                            **dict(re.findall(r"(\w+)=(\S+)", rest))))
+    # the log only grows: an event.voided cancels the event it names, and is not counted itself
+    void = {(e["subj"], e.get("of_kind"), e.get("of_at")) for e in out if e["kind"] == "event.voided"}
+    return [e for e in out if e["kind"] != "event.voided" and (e["subj"], e["kind"], e["stamp"]) not in void]
+
+
+def pct(v, p):
+    v = sorted(v)
+    return v[min(len(v) - 1, int(len(v) * p))]
+
+
+def hours(a, b):
+    return (b - a).total_seconds() / 3600
+
+
+def span(v):
+    return f"p50 {pct(v, .5):.1f} h, p90 {pct(v, .9):.1f} h" if v else "nothing to measure"
+
+
+def first(events, kinds):
+    """subject -> the first event of one of these kinds."""
+    out = {}
+    for e in events:
+        if e["kind"] in kinds and e["subj"] not in out:
+            out[e["subj"]] = e
+    return out
+
+
+def report(events, since, until, prompts=None, explain=False):
+    inside = lambda e: since <= e["at"] < until
+    filed = first(events, ("task.filed", "question.asked"))
+    started, closed, landed = first(events, ("task.started",)), first(events, ("task.closed", "question.answered")), first(events, ("landed",))
+    ended = first(events, ("task.closed", "question.answered", "task.dropped"))  # out of the backlog, done or not
+    decision = lambda s: filed.get(s, {}).get("type") == "decision" or filed.get(s, {}).get("kind") == "question.asked"
+    landed_in = [s for s, e in landed.items() if inside(e) and s != "-"]
+    out = []
+
+    n = len(landed_in)
+    out.append(f"1 owner prompts per landed task: " + (f"{prompts / n:.1f} ({prompts} prompts, {n} landed)" if prompts is not None and n
+               else f"needs --prompts from digest ({n} landed)"))
+
+    lead = [hours(filed[s]["at"], landed[s]["at"]) for s in landed_in if s in filed]
+    lead1 = [hours(filed[s]["at"], landed[s]["at"]) for s in landed_in if s in filed and filed[s].get("priority") == "p1"]
+    out.append(f"2 lead time, filed to main: {span(lead)}; p1 p90 " + (f"{pct(lead1, .9):.1f} h" if lead1 else "none")
+               + f" (over {len(lead)} of {n} landed)")
+
+    asked = {s: e for s, e in filed.items() if decision(s) and e["at"] < until}
+    waiting = sorted((e["at"], s) for s, e in asked.items() if s not in ended or ended[s]["at"] >= until)
+    answered = [hours(asked[s]["at"], closed[s]["at"]) for s in asked if s in closed and inside(closed[s])]
+    adr_prop = first(events, ("adr.proposed",))
+    adr_acc = first(events, ("adr.accepted", "adr.retired"))  # rejected or merged: no longer waiting
+    adr_wait = [s for s, e in adr_prop.items() if e["at"] < until and (s not in adr_acc or adr_acc[s]["at"] >= until)]
+    proposals = [s for s, e in first(events, ("learning.proposed",)).items() if e["at"] < until]
+    oldest = f", oldest {waiting[0][1]} {hours(waiting[0][0], until) / 24:.0f} d" if waiting else ""
+    out.append(f"3 waiting for the owner at {until:%Y-%m-%d}: {len(waiting)} questions{oldest}; {len(adr_wait)} ADRs proposed, not accepted; "
+               f"{len(proposals)} learnings proposed; answered in the period {span(answered)}")
+
+    bugs = [s for s, e in filed.items() if inside(e) and e.get("type") == "bug"]
+    rolled = sum(e["kind"] == "rolled-back" and inside(e) for e in events)
+    released = sum(e["kind"] == "released" and inside(e) for e in events)
+    out.append(f"4 bugs filed per landed task: " + (f"{len(bugs) / n:.2f} ({len(bugs)} bugs, {n} landed)" if n else f"{len(bugs)} bugs, nothing landed")
+               + (f"; change failure rate {rolled / released:.0%}" if released else "; no releases: a proxy, not a failure rate"))
+
+    f_in = [s for s, e in filed.items() if inside(e)]
+    c_in = [s for s, e in ended.items() if inside(e)]
+    split = lambda ss, bug: sum((filed.get(s, {}).get("type") == "bug") == bug for s in ss)
+    ratio = lambda a, b: f"{a / b:.2f}" if b else "no closings"
+    out.append(f"5 filed per closed: {ratio(len(f_in), len(c_in))} ({len(f_in)} filed, {len(c_in)} closed or dropped); "
+               f"bugs {ratio(split(f_in, True), split(c_in, True))}, other {ratio(split(f_in, False), split(c_in, False))}")
+
+    approved = {e["subj"] for e in events if e["kind"] == "spec.approved" and e["at"] < until}
+    deviated = sum(e["kind"] == "spec.deviated" and inside(e) and e["subj"] in approved for e in events)
+    out.append(f"6 spec deviations per approved spec: " + (f"{deviated / len(approved):.2f} ({deviated} on {len(approved)} specs)" if approved
+               else "no spec.approved events"))
+
+    promoted = {e["subj"] for e in events if e["kind"] == "learning.promoted" and e["at"] < until}
+    repeated = sum(e["kind"] == "correction.repeated" and inside(e) and e["subj"] in promoted for e in events)
+    out.append(f"7 corrections repeated after their entry exists: " + (f"{repeated} on {len(promoted)} entries" if promoted
+               else "no learning.promoted events"))
+
+    if explain:
+        cyc = [hours(started[s]["at"], landed[s]["at"]) for s in landed_in if s in started]
+        out.append(f"cycle time, started to main: {span(cyc)} (over {len(cyc)} of {n} landed: starts exist only from xs start)")
+        for p in ("p0", "p1", "p2", "p3"):
+            q = [hours(filed[s]["at"], started[s]["at"]) for s in started if s in filed and inside(started[s]) and filed[s].get("priority") == p]
+            if q:
+                out.append(f"queue time {p}, filed to started: {span(q)} (over {len(q)})")
+        slow = sorted(((hours(filed[s]["at"], landed[s]["at"]), s) for s in landed_in if s in filed), reverse=True)[:max(1, len(lead) // 10)]
+        if slow:
+            out.append("slowest tenth, lead time: " + ", ".join(f"{s} {h:.0f} h" for h, s in slow))
+        stops = [(e, next((r for r in events if r["subj"] == e["subj"] and r["kind"] == "agent.started" and r["at"] > e["at"]), None))
+                 for e in events if e["kind"] == "agent.stopped" and e.get("reason") == "limit" and inside(e)]
+        idle = [hours(e["at"], r["at"] if r else min(until, dt.datetime.now(dt.timezone.utc))) for e, r in stops]
+        out.append("time stopped by a usage limit: " + (f"{sum(idle):.1f} h over {len(idle)} stops, {sum(not r for _, r in stops)} not resumed"
+                                                         if idle else "no agent.stopped reason=limit"))
+        bare = sum(e["kind"] == "landed" and e["subj"] == "-" and inside(e) for e in events)
+        out.append(f"landings without a task: {bare}")
+        opened, resolved = first(events, ("incident.opened",)), first(events, ("incident.resolved",))
+        opened = {s: e for s, e in opened.items() if inside(e)}
+        ttr = sorted(hours(e["at"], resolved[s]["at"]) for s, e in opened.items() if s in resolved and resolved[s]["at"] < until)
+        out.append("time to restore: " + (f"p50 {pct(ttr, .5):.1f} h, max {ttr[-1]:.1f} h" if ttr else "nothing to measure")
+                   + f" ({len(ttr)} of {len(opened)} resolved)")
+    return out
+
+
+def selftest():
+    log = """2026-11-01T09:00:00Z project/x T1 task.filed status=todo type=bug priority=p1
+2026-11-01T10:00:00Z project/x T1 task.started status=doing
+2026-11-01T11:00:00Z project/x T1 task.closed status=done
+2026-11-01T12:00:00Z project/x T1 landed on=main
+2026-11-01T09:00:00Z project/x T2 task.filed status=todo type=decision priority=p2
+2026-11-02T09:00:00Z project/x T3 task.filed status=todo type=task priority=p3
+2026-11-02T09:00:00Z project/x 0001 adr.proposed
+2026-11-02T10:00:00Z project/x - landed on=main
+2026-11-02T11:00:00Z project/x 0002 adr.proposed
+2026-11-02T12:00:00Z project/x 0002 adr.retired reason=removed
+2026-11-02T13:00:00Z project/x T4 task.filed status=todo type=task priority=p2
+2026-11-02T14:00:00Z project/x T4 event.voided of_kind=task.filed of_at=2026-11-02T13:00:00Z reason=imported_twice
+2026-11-01T09:00:00Z project/x db-down incident.opened what=db_down
+2026-11-01T11:00:00Z project/x db-down incident.resolved
+2026-11-02T09:00:00Z project/x slow-api incident.opened what=slow
+2026-11-02T10:00:00Z project/x slow-api incident.resolved
+2026-11-02T15:00:00Z project/x tls incident.opened what=tls_expired
+2026-11-01T10:30:00Z project/x T1 agent.stopped run=implementer reason=limit
+2026-11-01T10:30:00Z project/x T1 agent.stopped run=reviewer reason=end_turn
+2026-11-01T12:30:00Z project/x T1 agent.started run=implementer
+"""
+    out = report(parse(log), dt.datetime(2026, 11, 1, tzinfo=dt.timezone.utc), dt.datetime(2026, 11, 3, tzinfo=dt.timezone.utc), 6, True)
+    assert out[0] == "1 owner prompts per landed task: 6.0 (6 prompts, 1 landed)", out[0]
+    assert out[1] == "2 lead time, filed to main: p50 3.0 h, p90 3.0 h; p1 p90 3.0 h (over 1 of 1 landed)", out[1]
+    assert out[2].startswith("3 waiting for the owner at 2026-11-03: 1 questions, oldest T2 2 d; 1 ADRs proposed, not accepted"), out[2]
+    assert out[3] == "4 bugs filed per landed task: 1.00 (1 bugs, 1 landed); no releases: a proxy, not a failure rate", out[3]
+    assert out[4] == "5 filed per closed: 3.00 (3 filed, 1 closed or dropped); bugs 1.00, other no closings", out[4]
+    assert out[5] == "6 spec deviations per approved spec: no spec.approved events", out[5]
+    assert out[7] == "cycle time, started to main: p50 2.0 h, p90 2.0 h (over 1 of 1 landed: starts exist only from xs start)", out[7]
+    assert out[-3] == "time stopped by a usage limit: 2.0 h over 1 stops, 0 not resumed", out[-3]
+    assert out[-2] == "landings without a task: 1", out[-2]
+    assert out[-1] == "time to restore: p50 2.0 h, max 2.0 h (2 of 3 resolved)", out[-1]
+    print("flow: selftest ok")
+
+
+def main(argv):
+    if argv == ["--selftest"]:
+        return selftest()
+    if "-h" in argv or "--help" in argv:
+        return print(__doc__.strip())
+    def opt(name, default):
+        return argv[argv.index(name) + 1] if name in argv else default
+    day = lambda s: dt.datetime.fromisoformat(s).replace(tzinfo=dt.timezone.utc)
+    ledger = os.environ.get("XS_LEDGER", "xs-ledger")
+    r = subprocess.run(["git", "show", f"{ledger}:EVENTS.log"], capture_output=True, text=True)
+    if r.returncode:
+        sys.exit(f"flow: no EVENTS.log on the branch {ledger}: xs writes it; a repo that kept project/EVENTS.log runs xs migrate once")
+    events = parse(r.stdout)
+    since = day(opt("--since", "1970-01-01"))
+    until = day(opt("--until", "9999-01-01")) if "--until" in argv else dt.datetime.now(dt.timezone.utc)
+    prompts = int(opt("--prompts", "-1"))
+    print("\n".join(report(events, since, until, prompts if prompts >= 0 else None, "--explain" in argv)))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""guard: a Claude Code PreToolUse hook for Bash and for spawning agents.
+
+Denies what swept other sessions' work into a commit or rewrote a whole tree under other agents, what kills
+processes by name (other sessions' too), and what moves main outside `land`.
+Asks the person before anything leaves the machine or throws uncommitted work away.
+Refuses a spawn of a general-purpose agent without a model, and gives a spawn without an effort `medium`.
+Reads the hook's JSON on stdin; prints a decision only when it has one.
+Any client may ask it: pipe {"tool_name": "Bash", "tool_input": {"command": ...}, "agent_type": ...} and read
+hookSpecificOutput.permissionDecision (deny or ask; no output: no objection). A client of the Agent Client Protocol
+answers session/request_permission this way, so the same rules hold for every agent it drives.
+
+A guardrail against mistakes, not a security boundary: code run through an interpreter
+(python3 -c, node -e, a script file) is not inspected. Protect main on the git host as well.
+
+The read-only roles: the researcher runs only commands that read (git's reading forms, ls, cat, grep, find
+without -exec or -delete, xs status); the reviewer runs what reproduces a finding, but writes only under a
+temporary directory and never runs a git command that changes the repo. The role is the hook's agent_type.
+
+XS_GATE=autonomous (a team on the autonomous merge gate) lets agents push a feature branch and
+merge a pull request without asking. A push that names main, forces, or starts on main still asks.
+
+  python3 guard --selftest
+"""
+import json, os, re, shlex, subprocess, sys
+
+GIT = r'\bgit(?:\s+-[cC]\s+\S+)*\s+'
+DENY = [
+    (GIT + r'commit\b.*\s(?:-[b-zA-Z]*a[a-zA-Z]*|--all)(?=\s|$)',
+     'git commit -a sweeps in every modified file, other sessions\' too. Commit explicit paths: git commit -m "..." -- <paths>'),
+    (GIT + r'add\s+(?:.*\s)?(?:-A|--all|-u|--update|\.|:/)(?=\s|$)',
+     'git add -A / -u / . stages everything, other sessions\' work too. Add the files you changed by name.'),
+]
+DENY += [
+    (r'(?:^|[;&|(`\s])(?:pkill|killall)\b',
+     'pkill and killall match by name and stop other sessions\' processes too. Kill the PID you started: kill <pid>.'),
+    (GIT + r'(?:branch\s+(?:-f|--force)\s+(?:main|master)\b|update-ref\s+(?:refs/heads/)?(?:main|master)\b|fetch\s+\S+\s+\S*:(?:main|master)\b)',
+     'This moves main. main moves only through `land`.'),
+]
+ASK = [
+    (GIT + r'push\b', 'git push sends work off this machine.'),
+    (r'\b(?:npm|pnpm|yarn|cargo|twine|gem)\s+publish\b|\bgh\s+release\s+create\b', 'Publishing is public and permanent.'),
+    (r'\bgh\s+pr\s+merge\b', 'Merging a pull request moves the remote branch.'),
+    (GIT + r'(?:reset\s+--hard|clean\s+-\w*f|checkout\s+(?:\S+\s+)?--\s+\.|restore\s+(?:--\S+\s+)*\.(?=\s|$)|stash\b(?!\s+(?:list|show|pop|apply|branch)\b))',
+     'This throws away or hides uncommitted work, maybe another session\'s.'),
+]
+FORMATTERS = {'biome', 'prettier', 'eslint', 'ruff', 'black', 'stylelint'}
+SUBCOMMANDS = {'check', 'format', 'lint', 'fix', 'run', 'exec', 'x', 'npx', 'pnpm', 'yarn', 'bunx'}
+
+
+def strip_quotes(cmd):
+    return re.sub(r'"(?:\\.|[^"\\])*"|\'[^\']*\'', '""', cmd)
+
+
+SHELL_C = re.compile(r'\b(?:ba|z|da)?sh\s+(?:-\w+\s+)*-\w*c\s+(?:"((?:\\.|[^"\\])*)"|\'([^\']*)\')')
+
+
+def adds_directory(cmd, cwd):
+    """git add of a directory or a glob stages files other sessions changed in it."""
+    if not re.search(GIT + r'add\b', strip_quotes(cmd)):  # not when "git add" is only quoted text
+        return False
+    for m in re.finditer(GIT + r'add\s+([^;&|\n]*)', cmd):
+        try:
+            args = shlex.split(m.group(1))
+        except ValueError:
+            continue
+        for a in args:
+            if a and not a.startswith('-') and ('*' in a or os.path.isdir(os.path.join(cwd, a))):
+                return True
+    return False
+
+
+def whole_tree_format(cmd):
+    """A formatter that writes, given no file or only '.': it rewrites every agent's files."""
+    for part in re.split(r'&&|\|\||[;|\n]', cmd):
+        try:
+            words = shlex.split(part)
+        except ValueError:
+            continue
+        names = [w.rsplit('/', 1)[-1] for w in words]
+        hit = next((i for i, n in enumerate(names) if n in FORMATTERS), None)
+        if hit is None:
+            continue
+        args = words[hit + 1:]
+        writes = names[hit] == 'black' or any(a in ('--write', '--fix', '--apply', '--apply-unsafe') for a in args) \
+            or (names[hit] == 'ruff' and 'format' in args)
+        paths = [a for a in args if not a.startswith('-') and a not in SUBCOMMANDS]
+        if writes and (not paths or any(p in ('.', './', 'src', 'src/') for p in paths)):
+            return True
+    return False
+
+
+GIT_READ = {'log', 'diff', 'show', 'grep', 'status', 'blame', 'ls-files', 'ls-tree', 'rev-parse', 'rev-list',
+            'merge-base', 'describe', 'shortlog', 'cat-file', 'for-each-ref', 'show-ref', 'name-rev'}
+READ = {'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'rg', 'find', 'tree', 'file', 'stat', 'sort', 'uniq', 'cut', 'jq',
+        'echo', 'pwd', 'diff', 'basename', 'dirname', 'realpath', 'true'}
+TMP = ('/tmp/', '/private/tmp/', '/var/folders/', '/private/var/folders/', '/dev/null')
+
+
+def git_sub(words):
+    """The git subcommand of a split command, past -C and -c options."""
+    i = 1
+    while i < len(words) and words[i].startswith('-'):
+        i += 2 if words[i] in ('-C', '-c') else 1
+    return words[i] if i < len(words) else ''
+
+
+def in_tmp(path):
+    t = os.environ.get('TMPDIR', '')
+    return path.startswith(TMP) or bool(t) and path.startswith(t) or path.startswith(('$TMPDIR', '${TMPDIR'))
+
+
+def role_check(cmd, role):
+    """The reason a read-only role may not run cmd, or None."""
+    if role not in ('researcher', 'reviewer'):
+        return None
+    if re.search(r'\$\(|`', cmd):
+        return f'the {role} runs no command substitution: run each command on its own.'
+    for target in re.findall(r'(?<![0-9&])>>?\s*([^\s;&|]+)', strip_quotes(cmd)):
+        if not in_tmp(target):
+            return f'the {role} writes no file outside a temporary directory: {target}'
+    for part in re.split(r'&&|\|\||[;|\n]', cmd):
+        try:
+            words = shlex.split(part)
+        except ValueError:
+            return f'the {role} could not have this command read: {part.strip()}'
+        if not words or words[0] == 'cd':
+            continue
+        name = words[0].rsplit('/', 1)[-1]
+        if name == 'git' and git_sub(words) not in GIT_READ | {'branch', 'worktree', 'remote', 'config'}:
+            return f'the {role} runs only git commands that read, not git {git_sub(words)}.'
+        if name == 'git' and git_sub(words) in ('branch', 'worktree', 'remote', 'config') and \
+                any(w in ('-d', '-D', '-m', '-M', '-c', '-C', 'add', 'remove', 'prune', 'move', 'set-url', '--unset') or
+                    (git_sub(words) == 'config' and not w.startswith('-') and words.index(w) > words.index('config') + 1)
+                    for w in words[2:]):
+            return f'the {role} changes no branch, worktree, remote or setting.'
+        if role == 'researcher':
+            if name == 'xs' and (words[1:2] or [''])[0] in ('status', 'queue', 'search', 'where', 'next'):
+                continue
+            if name == 'find' and any(w in ('-exec', '-execdir', '-delete', '-ok', '-okdir') or w.startswith('-fprint') for w in words):
+                return 'the researcher runs find only to list: no -exec or -delete.'
+            if name != 'git' and name not in READ:
+                return f'the researcher runs only commands that read; {name} is not one of them.'
+        else:
+            if name == 'sed' and any(w.startswith('-i') or w == '--in-place' for w in words):
+                return 'the reviewer edits no file in place.'
+            if name in ('rm', 'mv', 'cp', 'tee', 'touch', 'mkdir', 'chmod', 'ln', 'truncate', 'install', 'rsync'):
+                paths = [w for w in words[1:] if not w.startswith('-')]
+                if not paths or not all(in_tmp(w) for w in (paths[-1:] if name in ('cp', 'mv', 'ln', 'install', 'rsync') else paths)):
+                    return f'the reviewer changes no file outside a temporary directory: {part.strip()}'
+    return None
+
+
+def on_main(cwd):
+    try:
+        return subprocess.run(['git', '-C', cwd, 'branch', '--show-current'], capture_output=True, text=True,
+                              timeout=5).stdout.strip() in ('main', 'master')
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+PUSH_RISK = r'\b(?:main|master)\b|\s(?:-[a-zA-Z]*f[a-zA-Z]*|--force\S*|--mirror|--all|--tags|--delete|-d)(?=\s|$)'
+
+
+def gated(bare, cwd):
+    """Under the autonomous gate: a plain push of a feature branch, or a pull-request merge."""
+    if os.environ.get('XS_GATE') != 'autonomous':
+        return False
+    if re.search(r'\bgh\s+pr\s+merge\b', bare):
+        return not re.search(r'--admin\b', bare)
+    pushes = re.findall(GIT + r'push\b[^;&|\n]*', bare)
+    return bool(pushes) and not any(re.search(PUSH_RISK, p) for p in pushes) and not on_main(cwd)
+
+
+def decide(cmd, cwd='.', role=''):
+    for m in SHELL_C.finditer(cmd):  # bash -c "...": judge the inner command too
+        inner = decide(m.group(1) if m.group(1) is not None else m.group(2), cwd, role)
+        if inner[0]:
+            return inner
+    if SHELL_C.search(cmd) and role in ('researcher', 'reviewer'):
+        cmd = SHELL_C.sub('true', cmd)  # the inner command was judged above
+    why = role_check(cmd, role)
+    if why:
+        return 'deny', why
+    bare = strip_quotes(cmd)
+    if adds_directory(cmd, cwd):
+        return 'deny', 'git add of a directory or glob stages other sessions\' files in it. Add the files you changed by name.'
+    for pattern, why in DENY:
+        if re.search(pattern, bare):
+            return 'deny', why
+    if whole_tree_format(cmd):
+        return 'deny', 'A formatter over the whole tree rewrites files other agents are editing. Pass the files you changed.'
+    for i, (pattern, why) in enumerate(ASK):
+        if re.search(pattern, bare) and not (i in (0, 2) and gated(bare, cwd)):
+            return 'ask', why
+    if re.search(GIT + r'(?:merge|rebase|cherry-pick|pull)\b', bare) and on_main(cwd):
+        return 'deny', 'This moves main. main moves only through `land`: deliver the branch with `land` from its worktree.'
+    return None, None
+
+
+GENERAL = ('', 'general-purpose', 'claude')
+
+
+def spawn(tool_input):
+    """A spawn: deny a general-purpose agent without a model; give a spawn without an effort `medium`."""
+    t = tool_input or {}
+    if t.get('subagent_type', '') == 'fork':  # a fork runs on its parent's model
+        return None, None, None
+    if not t.get('model') and t.get('subagent_type', '') in GENERAL:
+        return 'deny', 'Set the model on every spawn (and the effort): the default inherits the strongest.', None
+    if not t.get('effort'):
+        return 'allow', 'no effort set: medium', {**t, 'effort': 'medium'}
+    return None, None, None
+
+
+def selftest():
+    cases = {
+        'git commit -am "x"': 'deny',
+        'git -c commit.gpgsign=false commit -a -m x': 'deny',
+        'git commit --all -m x': 'deny',
+        'git commit -m "fix the -a flag" -- src/a.ts': None,
+        'git -c commit.gpgsign=false commit -m "$(cat <<\'EOF\'\nmsg -a\nEOF\n)" -- a.py': None,
+        'git commit --amend --no-edit': None,
+        'git add -A': 'deny',
+        'git add .': 'deny',
+        'git add -u': 'deny',
+        'git add src/a.ts test/a.test.ts': None,
+        'git add ./src/a.ts': None,
+        'npx biome check --write --unsafe': 'deny',
+        'npx @biomejs/biome format --write .': 'deny',
+        'npx biome check --write src/a.ts': None,
+        'npx prettier --write "src/**/*.ts"': None,
+        'ruff format': 'deny',
+        'black src/x.py': None,
+        'cd app && pnpm exec eslint --fix .': 'deny',
+        'npx biome check src': None,
+        'git push origin main': 'ask',
+        'npm publish': 'ask',
+        'gh pr merge 12 --squash': 'ask',
+        'git reset --hard HEAD~1': 'ask',
+        'git checkout -- .': 'ask',
+        'git stash': 'ask',
+        'git stash list': None,
+        'git status && git log --oneline -5': None,
+        'echo "git push is blocked"': None,
+        'bash -c "git reset --hard"': 'ask',
+        "sh -c 'git commit -am x'": 'deny',
+        'bash -c "git status"': None,
+        'git add adapters': 'deny',
+        'git add "*.md"': 'deny',
+        'git add adapters/claude-code/guard': None,
+        'git add "adapters/claude-code/guard"': None,
+        'echo "git add adapters"': None,
+    }
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))  # the XS repo
+    bad = [(c, want, decide(c, root)[0]) for c, want in cases.items() if decide(c, root)[0] != want]
+    os.environ['XS_GATE'] = 'autonomous'
+    here = subprocess.run(['git', 'branch', '--show-current'], capture_output=True, text=True).stdout.strip()
+    gate_cases = {
+        'git push -u origin feat/login': 'ask' if here in ('main', 'master') else None,
+        'git push origin main': 'ask',
+        'git push --force origin feat/login': 'ask',
+        'git push origin feat && git push -f origin feat': 'ask',
+        'gh pr merge 12 --auto --rebase': None,
+        'gh pr merge 12 --admin': 'ask',
+        'npm publish': 'ask',
+    }
+    bad += [(c, want, decide(c)[0]) for c, want in gate_cases.items() if decide(c)[0] != want]
+    os.environ.pop('XS_GATE')
+    role_cases = {
+        ('researcher', 'git log --oneline -5 && git -C sub diff main...feat'): None,
+        ('researcher', 'grep -rn "total" src | head -20'): None,
+        ('researcher', 'find . -name "*.py" -not -path "./.git/*"'): None,
+        ('researcher', 'xs status S03'): None,
+        ('researcher', 'cd app && ls -la'): None,
+        ('researcher', 'git checkout -b x'): 'deny',
+        ('researcher', 'git branch -D feat'): 'deny',
+        ('researcher', 'python3 -c "open(\'a\',\'w\')"'): 'deny',
+        ('researcher', 'find . -name "*.pyc" -delete'): 'deny',
+        ('researcher', 'cat a.py > b.py'): 'deny',
+        ('researcher', 'echo $(rm -rf x)'): 'deny',
+        ('researcher', 'bash -c "rm a"'): 'deny',
+        ('researcher', 'xs close T01'): 'deny',
+        ('reviewer', 'make check 2>&1 | tail -20'): None,
+        ('reviewer', 'python3 -m pytest tests/test_a.py -q > /tmp/out.txt'): None,
+        ('reviewer', 'mkdir -p /tmp/repro && cp a.py /tmp/repro/'): None,
+        ('reviewer', 'git diff main...feat'): None,
+        ('reviewer', 'git branch --list'): None,
+        ('reviewer', 'git commit -m x -- a.py'): 'deny',
+        ('reviewer', 'git stash list'): 'deny',
+        ('reviewer', 'sed -i "" s/a/b/ a.py'): 'deny',
+        ('reviewer', 'rm a.py'): 'deny',
+        ('reviewer', 'cp /tmp/x a.py'): 'deny',
+        ('reviewer', 'echo x >> a.py'): 'deny',
+        ('implementer', 'rm a.py && git commit -m x -- a.py'): None,
+        ('', 'python3 -c "print(1)"'): None,
+    }
+    bad += [(c, want, decide(c[1], root, c[0])[0]) for c, want in role_cases.items() if decide(c[1], root, c[0])[0] != want]
+    on_main_cases = {
+        'git merge night': 'deny' if here in ('main', 'master') else None,
+        'git branch -f main feat': 'deny',
+        'git update-ref refs/heads/main abc123': 'deny',
+        'git fetch . night:main': 'deny',
+        'pkill -f scripts/demo.sh': 'deny',
+        'sleep 1; killall node': 'deny',
+        'kill 4242': None,
+        'echo "pkill is denied"': None,
+    }
+    bad += [(c, want, decide(c, root)[0]) for c, want in on_main_cases.items() if decide(c, root)[0] != want]
+    spawn_cases = [
+        ({'subagent_type': 'general-purpose', 'prompt': 'x'}, 'deny', None),
+        ({'prompt': 'x', 'model': 'sonnet'}, 'allow', 'medium'),
+        ({'subagent_type': 'implementer', 'prompt': 'x'}, 'allow', 'medium'),
+        ({'prompt': 'x', 'model': 'opus', 'effort': 'high'}, None, None),
+        ({'subagent_type': 'fork', 'prompt': 'x'}, None, None),
+    ]
+    for t, want, effort in spawn_cases:
+        got, _, new = spawn(t)
+        if got != want or (new or {}).get('effort') != effort:
+            bad.append((t, want, got))
+    cases = {**cases, **gate_cases, **role_cases, **on_main_cases, **{str(t): w for t, w, _ in spawn_cases}}
+    assert not bad, '\n'.join(f'{c!r}: want {w}, got {g}' for c, w, g in bad)
+    print(f'guard selftest: {len(cases)} cases ok')
+
+
+def main():
+    try:
+        event = json.load(sys.stdin)
+    except ValueError:
+        return
+    if event.get('tool_name') in ('Agent', 'Task'):
+        decision, why, new = spawn(event.get('tool_input'))
+        if decision:
+            out = {'hookEventName': 'PreToolUse', 'permissionDecision': decision, 'permissionDecisionReason': f'guard: {why}'}
+            if new:
+                out['updatedInput'] = new
+            print(json.dumps({'hookSpecificOutput': out}))
+        return
+    if event.get('tool_name') != 'Bash':
+        return
+    decision, why = decide((event.get('tool_input') or {}).get('command', ''), event.get('cwd') or '.',
+                           (event.get('agent_type') or '').rsplit(':', 1)[-1])
+    if decision:
+        print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': decision,
+                                                 'permissionDecisionReason': f'guard: {why}'}}))
+
+
+if __name__ == '__main__':
+    selftest() if sys.argv[1:] == ['--selftest'] else main()

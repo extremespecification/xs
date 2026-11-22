@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/extremespecification/xs/security/advisories/new
+    about: Report it privately, not in an issue.
+  - name: Website
+    url: https://extremespecification.com
+    about: What XS is, in one page.

@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# where: what isn't landed yet. Worktrees and branches (local and remote) with commits not on main, tasks closed and not landed
+# (ejected ones with the reason), uncommitted files, stashes, disk.
+#   where              the answer to "is it on main?" and "where is that worktree?"
+#   where --preflight  also the checks before leaving a team running
+# MAIN=<branch> compares with something other than main; CHECK="<cmd>" makes --preflight run the checks on it.
+set -uo pipefail
+main=${MAIN:-main}
+ledger=${XS_LEDGER:-xs-ledger}
+tilde='~'
+root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "where: not in a git repo"; exit 1; }
+cd "$root" || exit 1
+git rev-parse -q --verify "refs/heads/$main" >/dev/null || { echo "where: no branch '$main' here (set MAIN=)"; exit 1; }
+
+echo "$root, on $(git branch --show-current || echo detached), compared with $main"
+echo
+echo "worktrees:"
+git worktree list --porcelain | awk '/^worktree /{p=substr($0,10)} /^branch /{print p "\t" substr($0,19)} /^detached/{print p "\t(detached)"}' |
+while IFS=$'\t' read -r path branch; do
+  case "$path" in
+    */.xs/worktrees/_integrate) printf '  %-56s %s\n' "${path/#$HOME/$tilde}" "integrator (xs integrate), not a task"; continue ;;
+    */.xs/ledger) printf '  %-56s %s\n' "${path/#$HOME/$tilde}" "ledger ($ledger), never lands"; continue ;;
+  esac
+  dirty=$(git -C "$path" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  note=''
+  if [ "$branch" != "(detached)" ] && [ "$branch" != "$main" ]; then
+    ahead=$(git rev-list --count "$main..$branch")
+    if [ "$ahead" = 0 ] && [ "$dirty" = 0 ]; then note='  landed, remove it'
+    elif [ "$ahead" != 0 ]; then note="  $ahead commit(s) not on $main, last $(git log -1 --format=%cr "$branch")"; fi
+  fi
+  [ "$dirty" != 0 ] && note="$note  $dirty uncommitted"
+  printf '  %-56s %-24s%s\n' "${path/#$HOME/$tilde}" "$branch" "$note"
+done
+
+wt_branches=$(git worktree list --porcelain | sed -n 's@^branch refs/heads/@@p')
+git fetch -q --all 2>/dev/null || true   # teammates' branches count too; offline, the last fetch has to do
+others=$(git for-each-ref --format='%(refname:short)' refs/heads refs/remotes | while read -r b; do
+  [ "$b" = "$main" ] && continue
+  case "$b" in (*/HEAD|*/"$main"|"$ledger"|*/"$ledger") continue ;; esac
+  printf '%s\n' "$wt_branches" | grep -qxF "$b" && continue
+  git rev-parse -q --verify "refs/heads/${b#*/}" >/dev/null && [ "$b" != "${b#*/}" ] && git rev-parse -q --verify "refs/remotes/$b" >/dev/null && continue
+  n=$(git rev-list --count "$main..$b")
+  [ "$n" != 0 ] && printf '  %-40s %s commit(s) not on %s, last %s\n' "$b" "$n" "$main" "$(git log -1 --format=%cr "$b")"
+done)
+[ -n "$others" ] && { echo; echo "branches without a worktree:"; echo "$others"; }
+
+if git rev-parse -q --verify "refs/heads/$ledger" >/dev/null; then
+  closed=$("$(dirname "$0")/xs" status --unlanded 2>/dev/null || true)
+  [ -n "$closed" ] && { echo; echo "tasks closed, not on $main:"; sed 's/^/  /' <<<"$closed"; }
+fi
+
+stashes=$(git stash list | wc -l | tr -d ' ')
+[ "$stashes" != 0 ] && { echo; echo "stashes: $stashes (git stash list)"; }
+
+free_gb=$(df -Pk "$root" | awk 'NR==2 {print int($4/1048576)}')
+echo
+echo "disk: ${free_gb} GB free"
+
+[ "${1:-}" = --preflight ] || exit 0
+
+echo
+echo "preflight:"
+warn() { echo "  ! $*"; }
+[ "$free_gb" -lt 20 ] && warn "under 20 GB free: parallel builds and worktrees fill it"
+[ "$(git config --get commit.gpgsign)" = true ] && warn "commits are signed: will a signing prompt stop an agent at night? (git -c commit.gpgsign=false)"
+if [ -n "$(git -C "$root" status --porcelain --untracked-files=no)" ]; then warn "uncommitted changes in $root: another session's work? leave it, but agents must not commit it"; fi
+if ls docker-compose*.y*ml compose*.y*ml >/dev/null 2>&1 && ! docker info >/dev/null 2>&1; then warn "a compose file is here but Docker isn't running"; fi
+if [ "$(uname)" = Darwin ] && ! pgrep -x caffeinate >/dev/null; then warn "nothing keeps the Mac awake: run the night under caffeinate -i"; fi
+if [ -n "${CHECK:-}" ]; then
+  echo "  running: $CHECK"
+  log=$(mktemp)
+  if bash -c "$CHECK" >"$log" 2>&1; then echo "  checks green on $(git branch --show-current)"
+  else warn "checks red on $(git branch --show-current): fix the base first (log: $log)"; fi
+fi
+echo "  done; also confirm the usage budget and how many agents run at once"

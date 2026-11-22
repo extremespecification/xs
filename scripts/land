@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# land: deliver this worktree's branch to the integrator, which brings it onto main (xs integrate).
+#   land           from a worktree on its own branch: wait for the outcome (landed, or ejected and why)
+#   land --queue   return at once: the worker goes on writing code while the integrator lands the branch
+#   land --keep    keep the worktree and the branch afterwards, moved to what landed (the next task of a chain)
+#   with "- Merge train: github|gitlab" in AGENTS.md (or LAND_FORGE), push and queue in the forge's merge queue or train
+#   land --dry-run run the refusals and CHECK_CHANGE, print what would be queued; queue nothing, move nothing
+# Here, on the branch as it is, with no rebase: the refusals below, then CHECK_CHANGE (default: make check-change if the Makefile has it), what
+# proves the change on its own. The integrator rebases the queued branches together and runs CHECK_GATE
+# (default: make check; CHECK is its old name) once per round. MAIN=<branch> lands somewhere other than main.
+# The state of tasks, specs and ADRs is not on the branch: it lives in the ledger (xs-ledger), written by xs.
+# The integrator, after the gate, records one landed event per task the branch closed, in the ledger; on main it
+# commits only the code, and the marks of the memory entries whose anchor the round changed (xs stale).
+set -euo pipefail
+main=${MAIN:-main}
+change=${CHECK_CHANGE:-}
+[ -n "$change" ] || ! make -n check-change >/dev/null 2>&1 || change='make check-change'   # the template's target
+die() { echo "land: $*" >&2; exit 1; }
+keep=nokeep; queue=''; dry=''
+for a in "$@"; do case "$a" in --keep) keep=keep ;; --queue) queue=--queue ;; --dry-run) dry=1 ;; *) die "unknown option $a" ;; esac; done
+
+branch=$(git branch --show-current)
+[ -n "$branch" ] && [ "$branch" != "$main" ] || die "run it in a worktree on its own branch, not on $main"
+[ "$branch" != "${XS_LEDGER:-xs-ledger}" ] || die "$branch is the ledger: it never lands on $main, xs commits it"
+# untracked files count: the checks would pass on them while main received the commits without them
+[ -z "$(git status --porcelain)" ] || die "commit or ignore every file first: land only lands what is committed"
+n=$(git rev-list --count "$main..HEAD")
+[ "$n" != 0 ] || die "nothing to land: $branch has no commits that $main lacks"
+
+cd "$(git rev-parse --show-toplevel)"
+if [ -n "$change" ]; then
+  echo "land: $change"
+  bash -c "$change" || die "CHECK_CHANGE is red on $branch: nothing queued"
+fi
+[ -z "$dry" ] || { echo "land: dry run, would queue $branch for $main ($n commit(s)):"; git log --oneline "$main..HEAD"; exit 0; }
+# With a forge, its merge train lands the branch: "Merge train: github|gitlab" in AGENTS.md, or LAND_FORGE.
+# ponytail: the forge records the merge; the ledger's landed event waits for a sync from the forge (not written here)
+forge=${LAND_FORGE:-$( [ -f AGENTS.md ] && grep -oE '^- Merge train:[[:space:]]*(github|gitlab)' AGENTS.md | grep -oE '(github|gitlab)$' || true)}
+case "$forge" in
+  github)
+    git push -q -u origin "$branch"
+    gh pr view "$branch" >/dev/null 2>&1 || gh pr create --fill --base "$main" --head "$branch" >/dev/null
+    gh pr merge "$branch" --auto --rebase
+    echo "land: $branch queued in GitHub's merge queue for $main"; exit 0 ;;
+  gitlab)
+    git push -q -u origin "$branch"
+    glab mr view "$branch" >/dev/null 2>&1 || glab mr create --fill --yes --target-branch "$main" --source-branch "$branch" >/dev/null
+    glab mr merge "$branch" --auto-merge --yes
+    echo "land: $branch queued in GitLab's merge train for $main"; exit 0 ;;
+esac
+exec "$(dirname "$0")/xs" integrate --deliver "$branch" "$(git rev-parse --show-toplevel)" "$keep" $queue
