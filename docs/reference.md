@@ -139,7 +139,7 @@ The reasons of `agent.stopped` are those of the Agent Client Protocol's `stopRea
 
 | Hook | On | Does |
 |---|---|---|
-| `guard` | PreToolUse: Bash, Edit, Write, MultiEdit, NotebookEdit, Agent, Task | denies sweeping commits, killing by name, moving `main` outside `land`, and writing the integrator's queue or lock (`xs-queue`, `xs-integrate.lock`: by path for the file tools; a Bash command that names them may only read); asks before anything leaves the machine; refuses a spawn of a generic subagent (one with no role) that names no model, and sets a missing effort to `medium`; confines the read-only roles. Its JSON on stdin is tool-neutral: any client, an ACP client included, can ask it. |
+| `guard` | PreToolUse: Bash, Edit, Write, MultiEdit, NotebookEdit, Agent, Task | denies sweeping commits, killing by name, moving `main` outside `land`, and an ordinary write to the integrator's queue or lock (`xs-queue`, `xs-integrate.lock`: by path for the file tools; a Bash command with a path to them may only read, with no redirection), not a deliberate one, which only an OS sandbox stops; it runs on every Edit and Write, one python3 start each; asks before anything leaves the machine; refuses a spawn of a generic subagent (one with no role) that names no model, and sets a missing effort to `medium`; confines the read-only roles. Its JSON on stdin is tool-neutral: any client, an ACP client included, can ask it. |
 | `lifecycle` | PreToolUse: Agent, Task; SubagentStop | records `agent.started` for a spawn whose prompt names a task, and `agent.finished`, or `agent.stopped reason=limit` when the agent's transcript ends on a usage limit. |
 
 `xs install` registers both in `~/.claude/settings.json`.

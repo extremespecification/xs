@@ -2,10 +2,11 @@
 """guard: a Claude Code PreToolUse hook for Bash, for writing files and for spawning agents.
 
 Denies what swept other sessions' work into a commit or rewrote a whole tree under other agents, what kills
-processes by name (other sessions' too), and what moves main outside `land`. Denies every write to the integrator's
-queue and lock (xs-queue, xs-integrate.lock in the git directory): an entry pins the commit `land` saw, and a
-written entry would land a commit no check saw. Only `land` and `xs integrate` write them. Edit and Write are
-checked by path; a Bash command that names them may only read them (ls, cat, ...).
+processes by name (other sessions' too), and what moves main outside `land`. Denies an ordinary write to the
+integrator's queue and lock (xs-queue, xs-integrate.lock in the git directory): an entry pins the commit `land`
+saw, and a written entry would land a commit no check saw. Only `land` and `xs integrate` write them. Edit and
+Write are checked by path; a Bash command with a path to them may only read them, with no redirection. A regex
+over a command line stops a mistake, not an agent set on it: an OS sandbox that denies the paths is the boundary.
 Asks the person before anything leaves the machine or throws uncommitted work away.
 Refuses a spawn of a general-purpose agent without a model, and gives a spawn without an effort `medium`.
 Reads the hook's JSON on stdin; prints a decision only when it has one.
@@ -154,16 +155,20 @@ def role_check(cmd, role):
     return None
 
 
-QUEUE = re.compile(r'(?:^|[/\s\'"=])(?:xs-queue|xs-integrate\.lock)(?=[/\s\'";&|)]|$)')
+# a path to the queue or the lock: a "/" before the name. "the xs-queue parser" in a message is not one
+QUEUE = re.compile(r'/(?:xs-queue|xs-integrate\.lock)(?![\w.-])', re.I)
+QUEUE_FILE = re.compile(r'(?:^|/)[^/]*\.git/(?:xs-queue|xs-integrate\.lock)(?:/|$)')  # in a git dir, lowercased
+QUEUE_READ = READ - {'sort', 'uniq', 'tree'}  # sort -o, uniq IN OUT and tree -o write
 QUEUE_WHY = ('The integrator\'s queue and lock (xs-queue, xs-integrate.lock in the git directory) are written only by '
              '`land` and `xs integrate`: an entry pins the commit land checked. Deliver the branch with `land`.')
 
 
 def writes_queue(cmd):
-    """A command that names the queue or the lock, unless every command in it only reads."""
+    """A command with a path to the queue or the lock, unless every command in it only reads and nothing is
+    redirected. It catches an ordinary edit, not a deliberate one: the sandbox denies the paths themselves."""
     if not QUEUE.search(cmd):
         return False
-    if any(QUEUE.search(' ' + t) for t in re.findall(r'(?<![0-9&])>>?\s*([^\s;&|]+)', cmd)):
+    if re.search(r'>', strip_quotes(cmd)):  # any redirection: 1>, 2>, &>, >|, >>
         return True
     subs = re.findall(r'\$\(([^()]*)\)|`([^`]*)`', cmd)  # each substitution is a command of its own
     flat = re.sub(r'\$\([^()]*\)|`[^`]*`', 'SUB', cmd)
@@ -177,19 +182,21 @@ def writes_queue(cmd):
         if not words or words[0] in ('cd', 'do', 'done', 'then', 'fi'):
             continue
         name = words[0].rsplit('/', 1)[-1]
-        if name == 'git' and git_sub(words) in GIT_READ:
+        if name == 'git' and git_sub(words) in GIT_READ and not any(w.startswith('--output') for w in words):
             continue
-        if name in READ and not (name == 'find' and any(w in ('-exec', '-execdir', '-delete', '-ok', '-okdir') for w in words)):
+        if name in QUEUE_READ and not (name == 'find' and any(
+                w in ('-exec', '-execdir', '-delete', '-ok', '-okdir') or w.startswith(('-fprint', '-fls')) for w in words)):
             continue
         return True
     return False
 
 
 def writes_queue_file(tool_input):
-    """Edit, Write, MultiEdit or NotebookEdit of a file in the queue, or of the lock."""
+    """Edit, Write, MultiEdit or NotebookEdit of a file in the queue of a git dir, or of its lock; the path as given
+    and as resolved, lowercased (a case-insensitive file system). src/xs-queue/index.ts is not one."""
     t = tool_input or {}
     path = t.get('file_path') or t.get('notebook_path') or ''
-    return bool(path) and bool(QUEUE.search('/' + os.path.normpath(path)))
+    return bool(path) and any(QUEUE_FILE.search(p.lower()) for p in (os.path.normpath(path), os.path.realpath(path)))
 
 
 def on_main(cwd):
@@ -301,7 +308,15 @@ def selftest():
         'rm -rf .git/xs-integrate.lock': 'deny',
         'mkdir .git/xs-integrate.lock': 'deny',
         'cp entry .git/xs-queue/': 'deny',
-        'q=xs-queue; for f in .git/$q/*; do rm $f; done': 'deny',
+        'ls .git/xs-queue 2>/dev/null': 'deny',
+        'ls .git/xs-queue &> /tmp/x': 'deny',
+        'echo x 1> .git/XS-QUEUE/1-feat': 'deny',
+        'sort -o .git/xs-queue/1-feat a': 'deny',
+        'tree -o .git/xs-queue/1-x .': 'deny',
+        'find .git/xs-queue -fprint /tmp/x': 'deny',
+        'git diff --output=.git/xs-queue/1-x': 'deny',
+        'git commit -m "fix the xs-queue parser" -- scripts/xs': None,
+        'xs note T01 "the xs-integrate.lock was stale"': None,
         'ls .git/xs-queue | xargs rm': 'deny',
         'python3 -c "open(\'.git/xs-queue/1-x\',\'w\')"': 'deny',
         'sed -i.bak s/a/b/ .git/xs-queue/1-feat': 'deny',
@@ -369,6 +384,9 @@ def selftest():
         ('Write', '.git/xs-queue/../xs-queue/2-x'): True,
         ('Edit', '/repo/scripts/xs'): False,
         ('Write', '/repo/docs/xs-queue.md'): False,
+        ('Write', '/repo/src/xs-queue/index.ts'): False,
+        ('Write', '/repo/.GIT/XS-QUEUE/1-feat'): True,
+        ('Write', '/srv/proj.git/xs-integrate.lock/pid'): True,
     }
     bad += [(c, w, writes_queue_file({'file_path': c[1]})) for c, w in file_cases.items() if writes_queue_file({'file_path': c[1]}) != w]
     spawn_cases = [

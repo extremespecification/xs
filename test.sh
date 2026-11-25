@@ -494,6 +494,10 @@ HOME=$h "$xs" install >/dev/null && HOME=$h "$xs" install >/dev/null || fail "xs
 python3 -c "import json,sys; h=json.load(open(sys.argv[1]))['hooks']; assert [m['hooks'][0]['command'].rsplit('/',1)[1] for m in h['PreToolUse']] == ['guard', 'lifecycle'] and h['SubagentStop'][0]['hooks'][0]['command'].endswith('/lifecycle')" "$h/.claude/settings.json" || fail "xs install did not register the lifecycle hooks once"
 python3 -c "import json,sys; p=sys.argv[1]; c=json.load(open(p)); c['hooks']['PreToolUse'][0]['matcher']='Bash'; json.dump(c,open(p,'w'))" "$h/.claude/settings.json"
 HOME=$h "$xs" install >/dev/null && grep -q '"Bash|Edit|Write|MultiEdit|NotebookEdit|Agent|Task"' "$h/.claude/settings.json" || fail "xs install did not extend an older hook to spawns and file writes"
+# a group the guard shares with another hook keeps its matcher; the guard gets a group of its own, once
+python3 -c "import json,sys; p=sys.argv[1]; c=json.load(open(p)); g=c['hooks']['PreToolUse'][0]; g['matcher']='Bash'; g['hooks'].insert(0, {'type': 'command', 'command': 'theirs'}); json.dump(c,open(p,'w'))" "$h/.claude/settings.json"
+HOME=$h "$xs" install >/dev/null && HOME=$h "$xs" install >/dev/null || fail "xs install failed on a shared hook group"
+python3 -c "import json,sys; pre=json.load(open(sys.argv[1]))['hooks']['PreToolUse']; assert pre[0]['matcher'] == 'Bash' and [h['command'] for h in pre[0]['hooks']][0] == 'theirs', pre; assert [m['matcher'] for m in pre if m['hooks'][0]['command'].endswith('/guard')] == ['Bash|Edit|Write|MultiEdit|NotebookEdit|Agent|Task'], pre; assert len(pre) == 3, pre" "$h/.claude/settings.json" || fail "xs install rewrote a shared hook group, or did not give the guard its own"
 ln -s "$here/skills/distill" "$h/.claude/skills/distill" && ln -s /nowhere "$h/.claude/skills/theirs"
 HOME=$h "$xs" install >/dev/null && [ ! -L "$h/.claude/skills/distill" ] && [ -L "$h/.claude/skills/theirs" ] || fail "xs install did not remove only its own dangling links"
 git init -q -b main ri && cd ri && git config user.name test && git config user.email test@example.com && echo 'my rules' > AGENTS.md

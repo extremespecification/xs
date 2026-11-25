@@ -1469,8 +1469,8 @@ def cmd_integrate(args):
     built, a branch whose ref no longer points to it (moved or deleted after land) is ejected as moved, and the
     round is rebuilt without it; a round picks the pinned commits, never what the ref holds later. After landing,
     a branch whose ref moved since is kept, with its worktree. An entry with no pin (queued before it) lands the
-    ref as it is. The pin holds against an agent that can write refs, not one that can write the queue: the guard
-    denies agents the queue and the lock. An ejected branch stays as it was; land.ejected records why.
+    ref as it is. The pin holds against an agent that can write refs, not one that can write the queue: an OS
+    sandbox denies agents the queue and the lock; the guard catches an ordinary edit of them. An ejected branch stays as it was; land.ejected records why.
     Queue, outcomes, logs and the lock live in the git dir, never in the repo."""
     common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
     qdir, lock = os.path.join(common, "xs-queue"), os.path.join(common, "xs-integrate.lock")
@@ -1827,9 +1827,15 @@ def cmd_install(args, here):
                 have.append({**({"matcher": matcher} if matcher else {}),
                              "hooks": [{"type": "command", "command": f"python3 {os.path.join(adapter, name)}"}]})
                 print(f"hook {name} on {event} added to {path}")
-            for m in ours:  # an older install guarded Bash only, or not the writes of files
-                if matcher and m.get("matcher") != matcher:
-                    m["matcher"], changed = matcher, True
+            if ours and matcher and not any(m.get("matcher") == matcher for m in ours):
+                # an older install guarded Bash only, or not the writes of files: widen a group that holds our hook
+                # alone; a group shared with other hooks keeps its matcher, and ours gets a group of its own
+                alone = [m for m in ours if len(m.get("hooks", [])) == 1]
+                if alone:
+                    alone[0]["matcher"] = matcher
+                else:
+                    have.append({"matcher": matcher, "hooks": [{"type": "command", "command": f"python3 {os.path.join(adapter, name)}"}]})
+                changed = True
             changed = changed or not ours
         if changed:
             json.dump(conf, open(path, "w"), indent=2)
