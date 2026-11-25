@@ -2,6 +2,12 @@
 
 Every release of XS, newest first. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow [Semantic Versioning](https://semver.org/). Until 1.0 the method may change between minor versions; the ledger's event format is the stable contract, and a change to it comes with a migration.
 
+## [Unreleased]
+
+### Toolset
+
+- `land` records the branch's tip in its queue entry, and the integrator ejects, with `land.ejected reason=moved`, a branch whose tip moved since; it cherry-picks the recorded commit, never what the ref holds later. A raw write of another branch's ref between its review and the round no longer reaches `main`. Entries queued before this change carry no tip and land as before.
+
 ## [0.1.0] - 2026-11-22
 
 First public release.

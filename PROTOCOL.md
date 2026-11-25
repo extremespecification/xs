@@ -60,7 +60,7 @@ XS is adopted in four levels. Each level is complete on its own. A project moves
 | Main | The shared line every change lands on: `main` in the reference toolset. |
 | Gate | The conditions a change satisfies before it reaches `main`: `CHECK_CHANGE` green on its branch, `CHECK_GATE` green on the round, no open `must-fix`, a person for each irreversible action. `CHECK_RELEASE` guards a release, not the gate. |
 | Integrator | The one process per repository that moves `main` (`xs integrate`): it takes the delivered branches in rounds and lands or ejects each. |
-| Ejected | Returned by the integrator, or held back by the forge's merge train, intact, with a `land.ejected` event and its reason: `conflict` or `red`; from a forge also `changes-requested` or `closed`. |
+| Ejected | Returned by the integrator, or held back by the forge's merge train, intact, with a `land.ejected` event and its reason: `conflict`, `red` or `moved`; from a forge also `changes-requested` or `closed`. |
 | Landed | Present on `main`, with the gate satisfied. |
 
 ## 2. Roles
@@ -290,13 +290,13 @@ A change reaches `main` when every condition holds:
 - **Commit what agents left uncommitted.** (P5; level 2) Evidence: none.
 - **Deliver every change with `land`; the worker never waits for the gate.** `land` runs its refusals and `CHECK_CHANGE` on the branch as it is, without a rebase, and queues the branch. A worker delivers with `land --queue`, which returns at once, and takes its next task; plain `land` waits for the outcome. With pull requests, the forge records the merge. (P3, P5; level 2) Evidence (E30).
 - **Move `main` only through the integrator, one per repository.** The guard denies a merge, rebase, cherry-pick or pull on `main` and any command that sets `main` by hand. Each round, in a workspace of its own:
-  1. Put every queued branch, in order, on top of `main`. Eject a branch that conflicts.
+  1. Put every queued branch, in order, on top of `main`, at the commit `land` recorded in the queue. Eject a branch whose tip moved since `land` (`moved`): what it points to now passed no check and no review. Eject a branch that conflicts.
   2. Run `CHECK_GATE` once on the round.
   3. Green: fast-forward `main` to the round, a compare-and-swap that fails if `main` moved meanwhile; rebuild the round and retry, three times at most. Only code moves `main`, with the marks of the entries of memory whose anchor the round changed. Record one `landed` event per task the round lands, in the ledger. Remove the workspace and the branch of what landed.
   4. Red: try the first half alone and leave the rest for the next round, down to the branch that fails. Eject it with the log of the gate.
 
   (P3, P5; level 2) Evidence: none.
-- **Hand an ejected branch back to its chain.** An ejection records `land.ejected` in the ledger with `reason=conflict` or `reason=red` and leaves the branch intact; its task stays `closed`. The lead gives it to an implementer with the conflicting files or the log of the gate, then delivers it again. A task ejected twice is blocked with `xs block`, never delivered a third time. (P5; level 2) Evidence: none.
+- **Hand an ejected branch back to its chain.** An ejection records `land.ejected` in the ledger with `reason=conflict`, `reason=red` or `reason=moved` and leaves the branch intact; its task stays `closed`. The lead gives it to an implementer with the conflicting files or the log of the gate, then delivers it again; a `moved` branch is reviewed again first, since someone wrote its ref after `land`. A task ejected twice is blocked with `xs block`, never delivered a third time. (P5; level 2) Evidence: none.
 - **Confirm with `xs where` that no finished work remains unlanded**: it lists the tasks closed and not on `main`, and why an ejected one was ejected. (P5; level 2) Evidence (E30).
 - **Read the commit conventions from `AGENTS.md`**: identity, trailers, signing. Resolve signing before a team is left running. (P1; level 2) Evidence (E32).
 - **Develop on the trunk.** Every branch lives for one task or one chain and reaches `main` through `land`, at any hour; no long-lived integration branch collects work before `main`. (P5; level 2) Evidence (E40).

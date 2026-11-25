@@ -1459,12 +1459,15 @@ def cmd_integrate(args):
     xs integrate                                   take every branch in the queue onto main, until it is empty
     xs integrate --deliver BRANCH WORKTREE KEEP    land's half: queue the branch, then wait for its outcome
     xs integrate --deliver ... --queue             queue it, start an integrator if none runs, return at once
+    xs integrate --deliver ... --tip SHA           pin the commit to land (default: the branch's tip now)
 
     A round puts every queued branch, in order, on top of main in a worktree of its own. A branch that conflicts
     is ejected. CHECK_GATE (default: make check) runs once on the whole round. Green: main moves to it by
     fast-forward, a compare-and-swap that fails if main moved meanwhile, and the round is rebuilt (three times
     at most). Red: the first half is tried alone and the rest waits for the next round, down to the one branch
-    that fails, which is ejected with its log. An ejected branch stays as it was; land.ejected records why.
+    that fails, which is ejected with its log. A branch whose tip is not the commit land recorded in the queue
+    (its ref moved after delivery) is ejected as moved, before the round. An ejected branch stays as it was;
+    land.ejected records why.
     Queue, outcomes, logs and the lock live in the git dir, never in the repo."""
     common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
     qdir, lock = os.path.join(common, "xs-queue"), os.path.join(common, "xs-integrate.lock")
@@ -1508,8 +1511,8 @@ def cmd_integrate(args):
         for name in sorted(os.listdir(qdir)):
             p = os.path.join(qdir, name)
             if re.match(r"\d+-", name) and os.path.isfile(p):
-                branch, wt, keep = open(p).read().split("\n")[:3]
-                out.append(dict(file=p, branch=branch, wt=wt, keep=keep == "keep"))
+                branch, wt, keep, tip = (open(p).read().split("\n") + [""])[:4]  # an entry from before the pin has no tip
+                out.append(dict(file=p, branch=branch, wt=wt, keep=keep == "keep", tip=tip))
         return out
 
     def run(*a, cwd=tw):
@@ -1542,8 +1545,15 @@ def cmd_integrate(args):
         reset()
         base, picked = run("rev-parse", "HEAD").stdout.strip(), []
         for e in entries:
+            if e["tip"]:  # the ref was written after land: what it points to now was never checked nor reviewed
+                now = run("rev-parse", "-q", "--verify", f"refs/heads/{e['branch']}^{{commit}}").stdout.strip()
+                if now != e["tip"]:
+                    eject(e, "moved", f"{e['branch']} is at {now[:12] or 'nothing'}, not at {e['tip'][:12]} as delivered: "
+                                      f"review what changed, then land it again")
+                    return True
             before = run("rev-parse", "HEAD").stdout.strip()
-            commits = git("rev-list", "--reverse", "--no-merges", f"{main}..{e['branch']}").split()
+            # the pinned tip, not the ref: a write between this check and the pick lands nothing it did not see
+            commits = git("rev-list", "--reverse", "--no-merges", f"{main}..{e['tip'] or e['branch']}").split()
             r = run("cherry-pick", "--allow-empty", "--keep-redundant-commits", *commits) if commits else None
             if r is not None and r.returncode:
                 files = run("diff", "--name-only", "--diff-filter=U").stdout.split() or ["see git rebase " + main]  # before the abort clears them
@@ -1588,7 +1598,8 @@ def cmd_integrate(args):
     if "--deliver" in args:
         i = args.index("--deliver")
         branch, wt, keep = args[i + 1:i + 4]
-        open(os.path.join(qdir, f"{time_ns()}-{branch.replace('/', '_')}"), "w").write(f"{branch}\n{wt}\n{keep}\n")
+        tip = args[args.index("--tip") + 1] if "--tip" in args else git("rev-parse", f"refs/heads/{branch}^{{commit}}")
+        open(os.path.join(qdir, f"{time_ns()}-{branch.replace('/', '_')}"), "w").write(f"{branch}\n{wt}\n{keep}\n{tip}\n")
         result = os.path.join(done, branch)
         if os.path.exists(result):
             os.remove(result)

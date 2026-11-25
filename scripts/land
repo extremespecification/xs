@@ -11,6 +11,8 @@
 # The state of tasks, specs and ADRs is not on the branch: it lives in the ledger (xs-ledger), written by xs.
 # The integrator, after the gate, records one landed event per task the branch closed, in the ledger; on main it
 # commits only the code, and the marks of the memory entries whose anchor the round changed (xs stale).
+# The queue entry pins the branch's tip: a branch whose ref moved after land (a raw write of refs/heads/<it>) is
+# ejected as moved, never landed with commits no check or review saw.
 set -euo pipefail
 main=${MAIN:-main}
 change=${CHECK_CHANGE:-}
@@ -24,6 +26,7 @@ branch=$(git branch --show-current)
 [ "$branch" != "${XS_LEDGER:-xs-ledger}" ] || die "$branch is the ledger: it never lands on $main, xs commits it"
 # untracked files count: the checks would pass on them while main received the commits without them
 [ -z "$(git status --porcelain)" ] || die "commit or ignore every file first: land only lands what is committed"
+tip=$(git rev-parse HEAD)   # what the checks and the review saw: the integrator lands this commit or ejects the branch
 n=$(git rev-list --count "$main..HEAD")
 [ "$n" != 0 ] || die "nothing to land: $branch has no commits that $main lacks"
 
@@ -48,4 +51,4 @@ case "$forge" in
     glab mr merge "$branch" --auto-merge --yes
     echo "land: $branch queued in GitLab's merge train for $main"; exit 0 ;;
 esac
-exec "$(dirname "$0")/xs" integrate --deliver "$branch" "$(git rev-parse --show-toplevel)" "$keep" $queue
+exec "$(dirname "$0")/xs" integrate --deliver "$branch" "$(git rev-parse --show-toplevel)" "$keep" --tip "$tip" $queue
