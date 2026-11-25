@@ -428,6 +428,7 @@ mkdir "$common/xs-integrate.lock" && echo $$ > "$common/xs-integrate.lock/pid" |
 deliver m1 'echo a > m1.txt'; deliver m2 'echo a > m2.txt'; deliver m5 'echo a > m5.txt'
 git worktree add -q .xs/worktrees/m3 -b m3 && (cd .xs/worktrees/m3 && echo a > m3.txt && git add m3.txt && git commit -q -m m3) &&
   printf 'm3\n%s\nnokeep\n' "$t/q/.xs/worktrees/m3" > "$common/xs-queue/$(date +%s)000000000-m3"   # the old format, with no tip line; its name sorts it first
+printf 'gone\n%s\nnokeep\n' "$t/q/.xs/worktrees/gone" > "$common/xs-queue/$(date +%s)000000001-gone"   # the old format, for a branch deleted since
 unreviewed=$(git -C .xs/worktrees/m1 commit-tree -p m1 -m unreviewed "$(cd .xs/worktrees/m1 && echo b > evil.txt && git add evil.txt && git write-tree)")
 git update-ref refs/heads/m1 "$unreviewed" && git update-ref -d refs/heads/m5
 rm -rf "$common/xs-integrate.lock"
@@ -438,6 +439,7 @@ grep -q ' - land.ejected branch=m1 reason=moved by=land$' .xs/ledger/EVENTS.log 
 [ "$(git rev-parse m1)" = "$unreviewed" ] || fail "the ejected moved branch was not left as it was"
 [ -f m2.txt ] || fail "an unmoved branch queued beside a moved one did not land"
 [ -f m3.txt ] || fail "an entry queued before the pin, with no tip, did not land"
+grep -q "ejected gone: moved. gone is gone: nothing to land" <<<"$out" || fail "an old entry for a deleted branch was not ejected as moved: $out"
 grep -q "ejected m5: moved. m5 is at nothing" <<<"$out" && [ ! -f m5.txt ] || fail "a pinned branch deleted after land was not ejected as moved: $out"
 # a ref written while the gate runs: the round lands the pinned commit, and keeps the branch that moved
 mkdir "$common/xs-integrate.lock" && echo $$ > "$common/xs-integrate.lock/pid" || fail "the integrator kept the lock"

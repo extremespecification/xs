@@ -1548,13 +1548,16 @@ def cmd_integrate(args):
         reset()
         base, picked = run("rev-parse", "HEAD").stdout.strip(), []
         for e in entries:
-            if e["tip"]:  # the ref was written after land: what it points to now was never checked nor reviewed
-                now = run("rev-parse", "-q", "--verify", f"refs/heads/{e['branch']}^{{commit}}").stdout.strip()
-                if now != e["tip"]:
-                    eject(e, "moved", f"{e['branch']} is at {now or 'nothing'}, not at {e['tip']} as delivered by land: "
-                                      f"reset it to what was delivered (git branch -f {e['branch']} {e['tip']}) "
-                                      f"or review what changed, then land it again")
-                    return True
+            # the ref was written after land, or is gone: what it points to now was never checked nor reviewed
+            now = run("rev-parse", "-q", "--verify", f"refs/heads/{e['branch']}^{{commit}}").stdout.strip()
+            if e["tip"] and now != e["tip"]:
+                eject(e, "moved", f"{e['branch']} is at {now or 'nothing'}, not at {e['tip']} as delivered by land: "
+                                  f"reset it to what was delivered (git branch -f {e['branch']} {e['tip']}) "
+                                  f"or review what changed, then land it again")
+                return True
+            if not now:  # an entry from before the pin, for a branch since deleted: nothing to land
+                eject(e, "moved", f"{e['branch']} is gone: nothing to land; deliver it again with land if it was wanted")
+                return True
             before = run("rev-parse", "HEAD").stdout.strip()
             # the pinned tip, not the ref: a write between this check and the pick lands nothing it did not see
             commits = git("rev-list", "--reverse", "--no-merges", f"{main}..{e['tip'] or e['branch']}").split()
