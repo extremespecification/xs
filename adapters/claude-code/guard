@@ -163,20 +163,26 @@ QUEUE_WHY = ('The integrator\'s queue and lock (xs-queue, xs-integrate.lock in t
              '`land` and `xs integrate`: an entry pins the commit land checked. Deliver the branch with `land`.')
 
 
+REDIRECT = re.compile(r'(?:\d*|&)>[>|]?\s*(&\d+|[^\s;&|<>]*)')
+REDIRECT_WHY = 'Drop the redirection to read the queue, or send it to /dev/null or a temporary directory.'
+
+
 def writes_queue(cmd):
-    """A command with a path to the queue or the lock, unless every command in it only reads and nothing is
-    redirected. It catches an ordinary edit, not a deliberate one: the sandbox denies the paths themselves."""
+    """Why a command with a path to the queue or the lock may not run: it does more than read, or redirects to
+    somewhere other than /dev/null, another descriptor (2>&1) or a temporary directory. '' when it only reads.
+    It catches an ordinary edit, not a deliberate one: the sandbox denies the paths themselves."""
     if not QUEUE.search(cmd):
-        return False
-    if re.search(r'>', strip_quotes(cmd)):  # any redirection: 1>, 2>, &>, >|, >>
-        return True
+        return ''
+    for target in REDIRECT.findall(strip_quotes(cmd)):  # 1>, 2>, &>, >|, >>: a quoted target is "" here, so denied
+        if not (re.fullmatch(r'&\d+', target) or (in_tmp(target) and not QUEUE.search(target))):
+            return REDIRECT_WHY
     subs = re.findall(r'\$\(([^()]*)\)|`([^`]*)`', cmd)  # each substitution is a command of its own
     flat = re.sub(r'\$\([^()]*\)|`[^`]*`', 'SUB', cmd)
     for part in re.split(r'&&|\|\||[;|\n]', flat) + [x or y for x, y in subs]:
         try:
             words = shlex.split(part)
         except ValueError:
-            return True
+            return QUEUE_WHY
         while words and re.match(r'\w+=', words[0]):  # VAR=value before the command, or alone
             words = words[1:]
         if not words or words[0] in ('cd', 'do', 'done', 'then', 'fi'):
@@ -187,8 +193,8 @@ def writes_queue(cmd):
         if name in QUEUE_READ and not (name == 'find' and any(
                 w in ('-exec', '-execdir', '-delete', '-ok', '-okdir') or w.startswith(('-fprint', '-fls')) for w in words)):
             continue
-        return True
-    return False
+        return QUEUE_WHY
+    return ''
 
 
 def writes_queue_file(tool_input):
@@ -231,8 +237,9 @@ def decide(cmd, cwd='.', role=''):
     if why:
         return 'deny', why
     bare = strip_quotes(cmd)
-    if writes_queue(cmd):
-        return 'deny', QUEUE_WHY
+    why = writes_queue(cmd)
+    if why:
+        return 'deny', why
     if adds_directory(cmd, cwd):
         return 'deny', 'git add of a directory or glob stages other sessions\' files in it. Add the files you changed by name.'
     for pattern, why in DENY:
@@ -308,8 +315,13 @@ def selftest():
         'rm -rf .git/xs-integrate.lock': 'deny',
         'mkdir .git/xs-integrate.lock': 'deny',
         'cp entry .git/xs-queue/': 'deny',
-        'ls .git/xs-queue 2>/dev/null': 'deny',
-        'ls .git/xs-queue &> /tmp/x': 'deny',
+        'ls .git/xs-queue 2>/dev/null': None,
+        'cat .git/xs-queue/1-feat 2>&1 | head': None,
+        'ls .git/xs-queue > /tmp/queue.txt': None,
+        'ls .git/xs-queue &> /tmp/x': None,
+        'ls .git/xs-queue > notes.txt': 'deny',
+        'ls .git/xs-queue > /tmp/repo/.git/xs-queue/1-x': 'deny',
+        'cat .git/xs-queue/1-a > "$OUT"': 'deny',
         'echo x 1> .git/XS-QUEUE/1-feat': 'deny',
         'sort -o .git/xs-queue/1-feat a': 'deny',
         'tree -o .git/xs-queue/1-x .': 'deny',
@@ -378,6 +390,9 @@ def selftest():
         'echo "pkill is denied"': None,
     }
     bad += [(c, want, decide(c, root)[0]) for c, want in on_main_cases.items() if decide(c, root)[0] != want]
+    for c, want in (('ls .git/xs-queue > notes.txt', REDIRECT_WHY), ('rm -rf .git/xs-integrate.lock', QUEUE_WHY)):
+        if decide(c, root)[1] != want:
+            bad.append((c, want, decide(c, root)[1]))
     file_cases = {
         ('Write', '/repo/.git/xs-queue/1-feat'): True,
         ('Edit', '/repo/.git/xs-integrate.lock/pid'): True,

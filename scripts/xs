@@ -1830,15 +1830,25 @@ def cmd_install(args, here):
                 have.append({**({"matcher": matcher} if matcher else {}),
                              "hooks": [{"type": "command", "command": f"python3 {os.path.join(adapter, name)}"}]})
                 print(f"hook {name} on {event} added to {path}")
-            if ours and matcher and not any(m.get("matcher") == matcher for m in ours):
-                # an older install guarded Bash only, or not the writes of files: widen a group that holds our hook
-                # alone; a group shared with other hooks keeps its matcher, and ours gets a group of its own
-                alone = [m for m in ours if len(m.get("hooks", [])) == 1]
-                if alone:
-                    alone[0]["matcher"] = matcher
-                else:
-                    have.append({"matcher": matcher, "hooks": [{"type": "command", "command": f"python3 {os.path.join(adapter, name)}"}]})
-                changed = True
+            if ours and matcher:
+                # an older install guarded Bash only, or not the writes of files. A group that holds our hook alone
+                # gets the tools it lacks, added to its own; ours leaves a group shared with other hooks, which keeps
+                # its matcher, for a group of its own: one run per tool call
+                mine = lambda h: h.get("command", "").endswith("/" + name)
+                alone = next((m for m in ours if len(m.get("hooks", [])) == 1), None)
+                if alone is None:
+                    alone = {"matcher": matcher, "hooks": [{"type": "command", "command": f"python3 {os.path.join(adapter, name)}"}]}
+                    have.append(alone)
+                    changed = True
+                old = alone.get("matcher") or ""
+                if old not in ("", "*"):  # no matcher, or "*": every tool already
+                    kept = old.split("|")
+                    union = "|".join(kept + [x for x in matcher.split("|") if x not in kept])
+                    if union != old:
+                        alone["matcher"], changed = union, True
+                for m in ours:
+                    if m is not alone and any(mine(h) for h in m.get("hooks", [])):
+                        m["hooks"], changed = [h for h in m["hooks"] if not mine(h)], True
             changed = changed or not ours
         if changed:
             json.dump(conf, open(path, "w"), indent=2)
