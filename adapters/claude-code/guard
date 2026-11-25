@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""guard: a Claude Code PreToolUse hook for Bash and for spawning agents.
+"""guard: a Claude Code PreToolUse hook for Bash, for writing files and for spawning agents.
 
 Denies what swept other sessions' work into a commit or rewrote a whole tree under other agents, what kills
-processes by name (other sessions' too), and what moves main outside `land`.
+processes by name (other sessions' too), and what moves main outside `land`. Denies every write to the integrator's
+queue and lock (xs-queue, xs-integrate.lock in the git directory): an entry pins the commit `land` saw, and a
+written entry would land a commit no check saw. Only `land` and `xs integrate` write them. Edit and Write are
+checked by path; a Bash command that names them may only read them (ls, cat, ...).
 Asks the person before anything leaves the machine or throws uncommitted work away.
 Refuses a spawn of a general-purpose agent without a model, and gives a spawn without an effort `medium`.
 Reads the hook's JSON on stdin; prints a decision only when it has one.
@@ -151,6 +154,44 @@ def role_check(cmd, role):
     return None
 
 
+QUEUE = re.compile(r'(?:^|[/\s\'"=])(?:xs-queue|xs-integrate\.lock)(?=[/\s\'";&|)]|$)')
+QUEUE_WHY = ('The integrator\'s queue and lock (xs-queue, xs-integrate.lock in the git directory) are written only by '
+             '`land` and `xs integrate`: an entry pins the commit land checked. Deliver the branch with `land`.')
+
+
+def writes_queue(cmd):
+    """A command that names the queue or the lock, unless every command in it only reads."""
+    if not QUEUE.search(cmd):
+        return False
+    if any(QUEUE.search(' ' + t) for t in re.findall(r'(?<![0-9&])>>?\s*([^\s;&|]+)', cmd)):
+        return True
+    subs = re.findall(r'\$\(([^()]*)\)|`([^`]*)`', cmd)  # each substitution is a command of its own
+    flat = re.sub(r'\$\([^()]*\)|`[^`]*`', 'SUB', cmd)
+    for part in re.split(r'&&|\|\||[;|\n]', flat) + [x or y for x, y in subs]:
+        try:
+            words = shlex.split(part)
+        except ValueError:
+            return True
+        while words and re.match(r'\w+=', words[0]):  # VAR=value before the command, or alone
+            words = words[1:]
+        if not words or words[0] in ('cd', 'do', 'done', 'then', 'fi'):
+            continue
+        name = words[0].rsplit('/', 1)[-1]
+        if name == 'git' and git_sub(words) in GIT_READ:
+            continue
+        if name in READ and not (name == 'find' and any(w in ('-exec', '-execdir', '-delete', '-ok', '-okdir') for w in words)):
+            continue
+        return True
+    return False
+
+
+def writes_queue_file(tool_input):
+    """Edit, Write, MultiEdit or NotebookEdit of a file in the queue, or of the lock."""
+    t = tool_input or {}
+    path = t.get('file_path') or t.get('notebook_path') or ''
+    return bool(path) and bool(QUEUE.search('/' + os.path.normpath(path)))
+
+
 def on_main(cwd):
     try:
         return subprocess.run(['git', '-C', cwd, 'branch', '--show-current'], capture_output=True, text=True,
@@ -183,6 +224,8 @@ def decide(cmd, cwd='.', role=''):
     if why:
         return 'deny', why
     bare = strip_quotes(cmd)
+    if writes_queue(cmd):
+        return 'deny', QUEUE_WHY
     if adds_directory(cmd, cwd):
         return 'deny', 'git add of a directory or glob stages other sessions\' files in it. Add the files you changed by name.'
     for pattern, why in DENY:
@@ -251,6 +294,19 @@ def selftest():
         'git add adapters/claude-code/guard': None,
         'git add "adapters/claude-code/guard"': None,
         'echo "git add adapters"': None,
+        'ls "$(git rev-parse --git-common-dir)/xs-queue"': None,
+        'cat .git/xs-queue/1-feat && git log -1 feat': None,
+        'echo x > .git/xs-queue/1-feat': 'deny',
+        'printf "feat\\n" >> "$(git rev-parse --git-common-dir)/xs-queue/1-feat"': 'deny',
+        'rm -rf .git/xs-integrate.lock': 'deny',
+        'mkdir .git/xs-integrate.lock': 'deny',
+        'cp entry .git/xs-queue/': 'deny',
+        'q=xs-queue; for f in .git/$q/*; do rm $f; done': 'deny',
+        'ls .git/xs-queue | xargs rm': 'deny',
+        'python3 -c "open(\'.git/xs-queue/1-x\',\'w\')"': 'deny',
+        'sed -i.bak s/a/b/ .git/xs-queue/1-feat': 'deny',
+        'grep -n xs-queue scripts/xs': None,
+        'land --queue': None,
     }
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))  # the XS repo
     bad = [(c, want, decide(c, root)[0]) for c, want in cases.items() if decide(c, root)[0] != want]
@@ -307,6 +363,14 @@ def selftest():
         'echo "pkill is denied"': None,
     }
     bad += [(c, want, decide(c, root)[0]) for c, want in on_main_cases.items() if decide(c, root)[0] != want]
+    file_cases = {
+        ('Write', '/repo/.git/xs-queue/1-feat'): True,
+        ('Edit', '/repo/.git/xs-integrate.lock/pid'): True,
+        ('Write', '.git/xs-queue/../xs-queue/2-x'): True,
+        ('Edit', '/repo/scripts/xs'): False,
+        ('Write', '/repo/docs/xs-queue.md'): False,
+    }
+    bad += [(c, w, writes_queue_file({'file_path': c[1]})) for c, w in file_cases.items() if writes_queue_file({'file_path': c[1]}) != w]
     spawn_cases = [
         ({'subagent_type': 'general-purpose', 'prompt': 'x'}, 'deny', None),
         ({'prompt': 'x', 'model': 'sonnet'}, 'allow', 'medium'),
@@ -318,7 +382,7 @@ def selftest():
         got, _, new = spawn(t)
         if got != want or (new or {}).get('effort') != effort:
             bad.append((t, want, got))
-    cases = {**cases, **gate_cases, **role_cases, **on_main_cases, **{str(t): w for t, w, _ in spawn_cases}}
+    cases = {**cases, **gate_cases, **role_cases, **on_main_cases, **file_cases, **{str(t): w for t, w, _ in spawn_cases}}
     assert not bad, '\n'.join(f'{c!r}: want {w}, got {g}' for c, w, g in bad)
     print(f'guard selftest: {len(cases)} cases ok')
 
@@ -335,6 +399,11 @@ def main():
             if new:
                 out['updatedInput'] = new
             print(json.dumps({'hookSpecificOutput': out}))
+        return
+    if event.get('tool_name') in ('Edit', 'Write', 'MultiEdit', 'NotebookEdit'):
+        if writes_queue_file(event.get('tool_input')):
+            print(json.dumps({'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
+                                                     'permissionDecisionReason': f'guard: {QUEUE_WHY}'}}))
         return
     if event.get('tool_name') != 'Bash':
         return

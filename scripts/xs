@@ -1819,7 +1819,7 @@ def cmd_install(args, here):
         path = os.path.join(claude, "settings.json")
         conf = json.load(open(path)) if os.path.exists(path) else {}
         hooks, changed = conf.setdefault("hooks", {}), False
-        for event, matcher, name in [("PreToolUse", "Bash|Agent|Task", "guard"), ("PreToolUse", "Agent|Task", "lifecycle"),
+        for event, matcher, name in [("PreToolUse", "Bash|Edit|Write|MultiEdit|NotebookEdit|Agent|Task", "guard"), ("PreToolUse", "Agent|Task", "lifecycle"),
                                      ("SubagentStop", None, "lifecycle")]:
             have = hooks.setdefault(event, [])
             ours = [m for m in have if any(h.get("command", "").endswith("/" + name) for h in m.get("hooks", []))]
@@ -1827,7 +1827,7 @@ def cmd_install(args, here):
                 have.append({**({"matcher": matcher} if matcher else {}),
                              "hooks": [{"type": "command", "command": f"python3 {os.path.join(adapter, name)}"}]})
                 print(f"hook {name} on {event} added to {path}")
-            for m in ours:  # an older install guarded Bash only
+            for m in ours:  # an older install guarded Bash only, or not the writes of files
                 if matcher and m.get("matcher") != matcher:
                     m["matcher"], changed = matcher, True
             changed = changed or not ours
