@@ -6,7 +6,7 @@ Every release of XS, newest first. The format follows [Keep a Changelog](https:/
 
 ### Toolset
 
-- `land` records the branch's tip in its queue entry, and the integrator ejects, with `land.ejected reason=moved`, a branch whose tip moved since; it cherry-picks the recorded commit, never what the ref holds later. A raw write of another branch's ref between its review and the round no longer reaches `main`. Entries queued before this change carry no tip and land as before.
+- `land` records the branch's tip in its queue entry, and the integrator ejects, with `land.ejected reason=moved`, a branch whose ref moved or was deleted since; it cherry-picks the recorded commit, never what the ref holds later, and after landing keeps a branch whose ref moved during the round. A raw write of another branch's ref after its `land` no longer reaches `main`. The pin is the commit `land` saw, not one a review recorded; it holds against an agent that can write refs, not one that can write the queue, so the guard must deny agents `xs-queue` and `xs-integrate.lock` in the git directory. Local integrator only: with a forge's merge train, the forge decides what it merges. Entries queued before this change carry no tip and land the ref as it is.
 
 ## [0.1.0] - 2026-11-22
 

@@ -86,12 +86,12 @@ land
 
 `land` delivers the branch to the integrator. It refuses when the branch has uncommitted or untracked files, when it has nothing `main` lacks, when it runs on `main` or on the ledger, and when `CHECK_CHANGE` fails on the branch as it is. It does not ask you to rebase. The integrator (`xs integrate`, one per repository) works in rounds, in a worktree of its own:
 
-1. **Rebase.** It puts every queued branch, in order, on top of `main`, and ejects a branch that conflicts.
+1. **Rebase.** It puts every queued branch, in order, on top of `main`, at the commit `land` recorded in the queue (the branch's tip when `land` ran), and ejects a branch that conflicts. A branch whose ref moved or was deleted after `land` is ejected as `moved`: what it points to now passed no check. The pin holds while agents cannot write `xs-queue` and `xs-integrate.lock` in the git directory: the guard must deny them.
 2. **Gate.** It runs `CHECK_GATE` once on the round.
-3. **Land, when green.** It fast-forwards `main` to the round, records one `landed` event per task with the commit on `main`, and the task becomes `done`. On `main` it commits only the code, and the marks of the memory entries the round made stale. It removes the worktrees and branches of what landed.
+3. **Land, when green.** It fast-forwards `main` to the round, records one `landed` event per task with the commit on `main`, and the task becomes `done`. On `main` it commits only the code, and the marks of the memory entries the round made stale. It removes the worktrees and branches of what landed; a branch whose ref moved during the round is kept, with its worktree, and the outcome says so.
 4. **Bisect, when red.** It tries the first half of the round alone and leaves the rest for the next round, down to the branch that fails, which it ejects with the gate's log.
 
-An ejection records `land.ejected` with its reason; the task stays `closed`, its branch stays as it was, and `xs status` and `xs where` show why.
+An ejection records `land.ejected` with its reason; the task stays `closed`, its branch stays as it was, and `xs status` and `xs where` show why. A `moved` branch is reset to the commit `land` delivered, `git branch -f <branch> <commit>` as the reason prints it, or reviewed again; then it is delivered again.
 
 `land` waits for the outcome; `land --queue` returns at once and starts an integrator if none runs, so that the agent goes on with its next task. With tens of agents, deliver with `--queue`: the gate then runs once per round, not once per branch. `land --dry-run` runs the refusals and `CHECK_CHANGE`, prints what would be queued, and stops: nothing is queued and `main` does not move.
 

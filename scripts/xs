@@ -1465,9 +1465,12 @@ def cmd_integrate(args):
     is ejected. CHECK_GATE (default: make check) runs once on the whole round. Green: main moves to it by
     fast-forward, a compare-and-swap that fails if main moved meanwhile, and the round is rebuilt (three times
     at most). Red: the first half is tried alone and the rest waits for the next round, down to the one branch
-    that fails, which is ejected with its log. A branch whose tip is not the commit land recorded in the queue
-    (its ref moved after delivery) is ejected as moved, before the round. An ejected branch stays as it was;
-    land.ejected records why.
+    that fails, which is ejected with its log. The queue entry pins the commit land saw: while the round is
+    built, a branch whose ref no longer points to it (moved or deleted after land) is ejected as moved, and the
+    round is rebuilt without it; a round picks the pinned commits, never what the ref holds later. After landing,
+    a branch whose ref moved since is kept, with its worktree. An entry with no pin (queued before it) lands the
+    ref as it is. The pin holds against an agent that can write refs, not one that can write the queue: the guard
+    denies agents the queue and the lock. An ejected branch stays as it was; land.ejected records why.
     Queue, outcomes, logs and the lock live in the git dir, never in the repo."""
     common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
     qdir, lock = os.path.join(common, "xs-queue"), os.path.join(common, "xs-integrate.lock")
@@ -1548,8 +1551,9 @@ def cmd_integrate(args):
             if e["tip"]:  # the ref was written after land: what it points to now was never checked nor reviewed
                 now = run("rev-parse", "-q", "--verify", f"refs/heads/{e['branch']}^{{commit}}").stdout.strip()
                 if now != e["tip"]:
-                    eject(e, "moved", f"{e['branch']} is at {now[:12] or 'nothing'}, not at {e['tip'][:12]} as delivered: "
-                                      f"review what changed, then land it again")
+                    eject(e, "moved", f"{e['branch']} is at {now or 'nothing'}, not at {e['tip']} as delivered by land: "
+                                      f"reset it to what was delivered (git branch -f {e['branch']} {e['tip']}) "
+                                      f"or review what changed, then land it again")
                     return True
             before = run("rev-parse", "HEAD").stdout.strip()
             # the pinned tip, not the ref: a write between this check and the pick lands nothing it did not see
@@ -1585,7 +1589,10 @@ def cmd_integrate(args):
         log_events(lines + stale, "land: " + " ".join(e["branch"] for e in picked))  # main has moved: never stop here
         for e in picked:
             note = ""
-            if e["keep"]:  # the chain goes on from what landed, or its next delivery would repeat these commits
+            now = run("rev-parse", "-q", "--verify", f"refs/heads/{e['branch']}^{{commit}}").stdout.strip()
+            if e["tip"] and now != e["tip"]:  # written during the round: what it holds now did not land, keep it
+                note = f"; kept {e['branch']} and its worktree: its ref moved to {now or 'nothing'} after land"
+            elif e["keep"]:  # the chain goes on from what landed, or its next delivery would repeat these commits
                 if not run("status", "--porcelain", cwd=e["wt"]).stdout:
                     run("reset", "-q", "--hard", main, cwd=e["wt"])
             elif os.path.isdir(e["wt"]) and run("worktree", "remove", e["wt"], cwd=main_wt).returncode == 0:
@@ -1598,7 +1605,7 @@ def cmd_integrate(args):
     if "--deliver" in args:
         i = args.index("--deliver")
         branch, wt, keep = args[i + 1:i + 4]
-        tip = args[args.index("--tip") + 1] if "--tip" in args else git("rev-parse", f"refs/heads/{branch}^{{commit}}")
+        tip = git("rev-parse", "--verify", (args[args.index("--tip") + 1] if "--tip" in args else f"refs/heads/{branch}") + "^{commit}")
         open(os.path.join(qdir, f"{time_ns()}-{branch.replace('/', '_')}"), "w").write(f"{branch}\n{wt}\n{keep}\n{tip}\n")
         result = os.path.join(done, branch)
         if os.path.exists(result):

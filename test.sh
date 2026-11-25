@@ -420,19 +420,28 @@ for _ in $(seq 50); do [ -f a9.txt ] && break; sleep 0.2; done
 # the queue pins the tip land saw: a ref written after delivery (an agent's raw write of another branch) is ejected
 for _ in $(seq 50); do [ -d "$common/xs-integrate.lock" ] || break; sleep 0.2; done   # b9's integrator lets go
 mkdir "$common/xs-integrate.lock" && echo $$ > "$common/xs-integrate.lock/pid" || fail "b9's integrator kept the lock"
-deliver m1 'echo a > m1.txt'; deliver m2 'echo a > m2.txt'
+deliver m1 'echo a > m1.txt'; deliver m2 'echo a > m2.txt'; deliver m5 'echo a > m5.txt'
 git worktree add -q .xs/worktrees/m3 -b m3 && (cd .xs/worktrees/m3 && echo a > m3.txt && git add m3.txt && git commit -q -m m3) &&
-  printf 'm3\n%s\nnokeep\n' "$t/q/.xs/worktrees/m3" > "$common/xs-queue/$(date +%s)000000000-m3"   # queued before the pin: no tip
+  printf 'm3\n%s\nnokeep\n' "$t/q/.xs/worktrees/m3" > "$common/xs-queue/$(date +%s)000000000-m3"   # the old format, with no tip line; its name sorts it first
 unreviewed=$(git -C .xs/worktrees/m1 commit-tree -p m1 -m unreviewed "$(cd .xs/worktrees/m1 && echo b > evil.txt && git add evil.txt && git write-tree)")
-git update-ref refs/heads/m1 "$unreviewed"
+git update-ref refs/heads/m1 "$unreviewed" && git update-ref -d refs/heads/m5
 rm -rf "$common/xs-integrate.lock"
 out=$("$xs" integrate 2>&1) || fail "xs integrate failed on a moved branch: $out"
-grep -q "ejected m1: moved. m1 is at ${unreviewed:0:12}, not at" <<<"$out" || fail "the integrator did not eject a branch whose tip moved: $out"
+grep -q "ejected m1: moved. m1 is at $unreviewed, not at [0-9a-f]\{40\} as delivered by land: reset it to what was delivered (git branch -f m1 " <<<"$out" || fail "the integrator did not eject a branch whose tip moved: $out"
 grep -q ' - land.ejected branch=m1 reason=moved by=land$' .xs/ledger/EVENTS.log || fail "the moved ejection is not in the ledger"
 [ ! -f m1.txt ] && [ ! -f evil.txt ] && ! git merge-base --is-ancestor "$unreviewed" main || fail "main took a branch whose tip moved after land"
 [ "$(git rev-parse m1)" = "$unreviewed" ] || fail "the ejected moved branch was not left as it was"
 [ -f m2.txt ] || fail "an unmoved branch queued beside a moved one did not land"
 [ -f m3.txt ] || fail "an entry queued before the pin, with no tip, did not land"
+grep -q "ejected m5: moved. m5 is at nothing" <<<"$out" && [ ! -f m5.txt ] || fail "a pinned branch deleted after land was not ejected as moved: $out"
+# a ref written while the gate runs: the round lands the pinned commit, and keeps the branch that moved
+mkdir "$common/xs-integrate.lock" && echo $$ > "$common/xs-integrate.lock/pid" || fail "the integrator kept the lock"
+deliver m6 'echo a > m6.txt'
+late=$(git -C .xs/worktrees/m6 commit-tree -p m6 -m late "$(cd .xs/worktrees/m6 && echo b > late.txt && git add late.txt && git write-tree)")
+rm -rf "$common/xs-integrate.lock"
+out=$(CHECK_GATE="git update-ref refs/heads/m6 $late" "$xs" integrate 2>&1) || fail "xs integrate failed on a ref moved during the gate: $out"
+grep -q "m6 landed; kept m6 and its worktree: its ref moved to $late after land" <<<"$out" || fail "the integrator did not keep a branch moved during the round: $out"
+[ -f m6.txt ] && [ ! -f late.txt ] && [ "$(git rev-parse m6)" = "$late" ] && [ -d .xs/worktrees/m6 ] || fail "a ref moved during the gate landed, or its branch was removed"
 unset CHECK_GATE
 # an ejected task stays closed, and where says why
 "$xs" file "Red task" >/dev/null && "$xs" start T02 --branch r1 >/dev/null
