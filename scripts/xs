@@ -1096,7 +1096,9 @@ def cmd_status(args):
         files = glob.glob(lpath("tasks", f"{i}-*.md")) + glob.glob(lpath("learnings", f"{i}-*.md")) + \
             glob.glob(f"project/specs/{i}-*.md") + glob.glob(f"project/adr/{i.replace('ADR-', '')}-*.md" if i.startswith("ADR-") else "")
         d = st.get(i, {})
-        print(f"{i}: {d.get('status') or (spec_status(i) if re.match(r'S\d+$', i) else 'no events')}"
+        # no backslash inside an f-string expression: python < 3.12 (macOS /usr/bin/python3 is 3.9) rejects it
+        status = d.get("status") or (spec_status(i) if re.match(r"S\d+$", i) else "no events")
+        print(f"{i}: {status}"
               + "".join(f", {k} {d[k]}" for k in ("branch", "built", "amended") if d.get(k)) + "".join(f"\n  {f}" for f in files))
         for e in events():
             if e["subj"] == i:
