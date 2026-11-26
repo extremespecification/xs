@@ -1,70 +1,96 @@
 #!/usr/bin/env python3
-"""xs: the only writer of the ledger. The ledger is the branch xs-ledger, checked out once at .xs/ledger:
-the tracker (tasks, memory entries, the Log of each spec, ideas) and EVENTS.log. main holds the product and its
-decisions; no command of xs commits to main. The state of every entry derives from its events (PROTOCOL P2, §3).
+"""xs: the only writer of the ledger (the branch xs-ledger, checked out at .xs/ledger). Run `xs` for the command list."""
 
-  xs install [--skills-dir DIR]            link the skills into each agent tool found in ~, or into DIR, with the tool's adapter
-  xs init                                  in a repo: add AGENTS.md and project/ (and the adapters' files), keeping every file already there; create the ledger
-  xs migrate                               once, in a repo that kept its tasks and EVENTS.log on main: move them to the ledger
-  xs status [T12|S03|ADR-0007|L02] | --unlanded   the state of every entry, of one, or of the tasks closed and not yet on main
-  xs status --since 2026-11-23             the report: every event since then
-  xs agent T12|--branch b started|stopped|finished run=<id> ...   an agent's life (tool, model, effort, role, session;
-                                           reason, resume_at, job; outcome); sent as an OpenTelemetry span when
-                                           OTEL_EXPORTER_OTLP_ENDPOINT is set
-  xs handoff T12 --next "step" [--open "request"]...   package a started task for another session, account or tool
-  xs takeover T12                          in any tool: prepare the worktree, apply the handed-off patch, print the brief
-  xs sync                                  with a forge's merge train: record as landed the closed tasks it merged
-  xs file [--type task|bug|prototype] [--priority p0|p1|p2|p3] [--spec S03] [--source TEXT] "title"
-  xs ask  [--priority p0|p1|p2|p3] [--spec S03] "question"   a decision task for the owner
-  xs next                                  tasks ready to start, p1 first; the WIP in use
-  xs start T12 --branch t12-slug           claim T12 and create its worktree from main
-  xs start T12 --branch b --run implementer   also launch AGENTS.md's "Agent implementer:" command there
-  xs close T12                             the worker closes T12 once its Done section holds the proof: closed, then done when it lands
-  xs answer T12                            the owner's answer is in T12's Done section: close it
-  xs answer T12 "answer"                   write the owner's answer in T12's Done section, then close it
-  xs block T12 "reason" | xs unblock T12 | xs drop T12 "why"
-  xs review T12                            the lead opens a review round of a doing task (PROTOCOL §6)
-  xs reviewed T12 approve|changes [--must-fix N]   the lead records the round's verdict and its must-fix findings
-  xs spec S12 opened|ready|done|dropped    a spec's status; ready runs the readiness gate, done checks its invariant tests on main
-  xs spec S12 approved|deviated|noted "line"   a dated line in the spec's Log, logs/S12.md in the ledger, with its event
-  xs adr 0007 proposed|accepted|retired ["line"]   an ADR's status, as an event; the ADR file is never edited
-  xs adr 0007 built "yes (T12)" | xs adr 0007 amended "ADR 0009 (what changed)"
-  xs release <name> [--commit <sha>] | xs rollback <name> "reason"   a release and its rollback, as events
-  xs incident open <slug> "line" [--sev 1|2|3|4] | resolve <slug>   an incident, for flow's time to restore
-  xs import-git [--dry-run]                once, for a repo with history: the events git can date
-  xs void T12 task.closed 2026-11-20T10:02:10Z "reason"   cancel a wrong event with a later one
-  xs where [...] | xs land [...]           run the scripts where and land beside xs (zsh has a builtin where)
-
-Memory (PROTOCOL §3): what an agent learns goes where its kind belongs; the agent proposes, the owner promotes.
-  xs idea [--source TEXT] "idea"           one dated line in IDEAS.md of the ledger
-  xs propose --kind rule|design|knowledge --anchor PATH --evidence TEXT [--to FILE] [--scope S] [--replaces L3] "entry"
-                                           --replaces: the amended text of a stale entry; promoting it retires L3
-  xs recommend L3 holds|retire "why"       the curator's recommendation on a stale entry, shown by xs queue
-  xs promote L3                            the owner accepts: the entry is written in its destination, marked (L3);
-                                           on a stale entry, the owner confirms it still holds
-  xs checked L3 "check"                    a check enforces it: the entry leaves its destination
-  xs retire L3 "why"                       the owner removes it
-  xs repeated L3 "what was corrected"     a correction the entry should have prevented (curator)
-  xs queue                                 what waits for the owner: open questions and proposals
-  xs stale MAIN                            entries whose anchor this branch changed become stale
-  xs load                                  for a session-start hook: records the recall of every loaded entry
-  xs search "words"                        entries matching the words, best first; records each recall
-Recalls go to the person's local log ($XS_HOME/events.log, default ~/.xs), never to git: one line per read.
-XS_SESSION names the session in a recall.
-
-An event line: <at> <scope> <subject> <kind> key=value ... (the contract of the ledger of events).
-Each command is one commit of the ledger, under a lock. Agents may edit the text of a task or an entry in
-.xs/ledger; xs commits that file with the next event about it, and refuses an EVENTS.log edited by hand.
-In a team, when main has an upstream, xs pulls the ledger before each command and pushes it after; a rejected push
-undoes the commit, pulls and runs the command again. XS_NO_PUSH=1 keeps the ledger local.
-XS_LEDGER renames the branch (default xs-ledger); the ledger's commits are not signed unless XS_LEDGER_SIGN=1; XS_SCOPE overrides the scope (project/<repo folder>); XS_BY names
-the actor (default: git user.name); MAIN names the base branch (default: main). The WIP limit is a line
-"WIP limit: <n>" in AGENTS.md. start --run <agent> launches the line "Agent <agent>: <command>" of AGENTS.md in the
-worktree, with the brief (--brief <file>, default the task file) as input; the log is in the git dir, xs-runs/<branch>.log.
-A task with `after: T41` (or several, comma-separated) is not ready until each is done or dropped, or is doing or closed
-on the branch it starts on: the chain it continues.
-"""
-import datetime as dt, fcntl, glob, json, os, re, shutil, subprocess, sys
+# The help text. Each section: (title, [(usage, what it does)]). Descriptions start with an imperative verb.
+HELP_INTRO = ("Record every change of state as an event on the ledger branch xs-ledger. "
+              "No xs command commits to main: main holds the product and its decisions (PROTOCOL P2, §3).")
+HELP = [
+    ("Set up", [
+        ("xs install [--skills-dir DIR]", "Link the skills into each agent tool found in ~, or into DIR."),
+        ("xs init", "Add AGENTS.md and project/ to the repo, keep existing files, create the ledger."),
+        ("xs migrate", "Move tasks and EVENTS.log from main to the ledger. Run once, in a repo that kept them on main."),
+        ("xs import-git [--dry-run]", "Create the events that git history can date. Run once, in a repo with history."),
+    ]),
+    ("Inspect", [
+        ("xs status [T12|S03|ADR-0007|L02]", "Show the state of every entry, or of one."),
+        ("xs status --unlanded", "List the tasks closed and not yet on main."),
+        ("xs status --since 2026-11-23", "List every event since a date."),
+        ("xs queue", "List what waits for the owner: open questions and proposals."),
+        ("xs next", "List the tasks ready to start, p1 first, and the WIP in use."),
+    ]),
+    ("Tasks", [
+        ("xs file [--type task|bug|prototype] [--priority p0|p1|p2|p3] [--spec S03] [--source TEXT] \"title\"",
+         "Create a task."),
+        ("xs ask [--priority p0|p1|p2|p3] [--spec S03] \"question\"", "Create a decision task for the owner."),
+        ("xs start T12 --branch t12-slug", "Claim T12 and create its worktree from main."),
+        ("xs start T12 --branch b --run implementer",
+         "Claim T12, then launch the \"Agent implementer:\" command of AGENTS.md in the worktree."),
+        ("xs close T12", "Close T12 once its Done section holds the proof. It becomes done when it lands."),
+        ("xs answer T12 [\"answer\"]",
+         "Close a decision task. With an answer, write it in the Done section first."),
+        ("xs block T12 \"reason\"", "Mark T12 as blocked."),
+        ("xs unblock T12", "Resume a blocked task."),
+        ("xs drop T12 \"why\"", "Abandon T12."),
+        ("xs review T12", "Open a review round for a task in doing (PROTOCOL §6)."),
+        ("xs reviewed T12 approve|changes [--must-fix N]", "Record the verdict of the round and its must-fix findings."),
+        ("xs void T12 task.closed 2026-11-20T10:02:10Z \"reason\"", "Cancel a wrong event with a later one."),
+    ]),
+    ("Agents and handoff", [
+        ("xs agent T12|--branch b started|stopped|finished run=<id> ...",
+         "Record an agent run (tool, model, effort, role, session, reason, resume_at, job, outcome). "
+         "Send it as an OpenTelemetry span when OTEL_EXPORTER_OTLP_ENDPOINT is set."),
+        ("xs handoff T12 --next \"step\" [--open \"request\"]...",
+         "Package a started task for another session, account or tool."),
+        ("xs takeover T12", "Prepare the worktree, apply the handed-off patch and print the brief."),
+        ("xs sync", "Record as landed the closed tasks that a forge's merge train merged."),
+        ("xs where [...] | xs land [...]", "Run the scripts where and land that sit beside xs (zsh has a builtin where)."),
+    ]),
+    ("Specs and decisions", [
+        ("xs spec S12 opened|ready|done|dropped",
+         "Set the status of a spec. ready runs the readiness gate; done checks its invariant tests on main."),
+        ("xs spec S12 approved|deviated|noted \"line\"",
+         "Append a dated line to the spec's Log (logs/S12.md in the ledger) and record the event."),
+        ("xs adr 0007 proposed|accepted|retired [\"line\"]",
+         "Record the status of an ADR as an event. The ADR file is never edited."),
+        ("xs adr 0007 built \"yes (T12)\"", "Record whether the ADR is built."),
+        ("xs adr 0007 amended \"ADR 0009 (what changed)\"", "Record the ADR that amended it."),
+        ("xs release <name> [--commit <sha>]", "Record a release."),
+        ("xs rollback <name> \"reason\"", "Record the rollback of a release."),
+        ("xs incident open <slug> \"line\" [--sev 1|2|3|4]", "Open an incident."),
+        ("xs incident resolve <slug>", "Resolve an incident. flow uses it for the time to restore."),
+    ]),
+    ("Memory (PROTOCOL §3): the agent proposes, the owner promotes", [
+        ("xs idea [--source TEXT] \"idea\"", "Append a dated line to IDEAS.md in the ledger."),
+        ("xs propose --kind rule|design|knowledge --anchor PATH --evidence TEXT [--to FILE] [--scope S] [--replaces L3] \"entry\"",
+         "Propose a memory entry. --replaces gives the amended text of a stale entry; promoting it retires L3."),
+        ("xs recommend L3 holds|retire \"why\"", "Record the curator's recommendation on a stale entry. xs queue shows it."),
+        ("xs promote L3", "Accept an entry: write it in its destination, marked (L3). On a stale entry, confirm that it still holds."),
+        ("xs checked L3 \"check\"", "Record the check that now enforces the entry, and remove it from its destination."),
+        ("xs retire L3 \"why\"", "Remove an entry."),
+        ("xs repeated L3 \"what was corrected\"", "Record a correction that the entry should have prevented (curator)."),
+        ("xs stale MAIN", "Mark as stale the entries whose anchor this branch changed."),
+        ("xs load", "For a session-start hook: record the recall of every loaded entry."),
+        ("xs search \"words\"", "List the entries that match the words, best first, and record each recall."),
+    ]),
+]
+HELP_NOTES = [
+    ("Ledger", "Each command is one commit on xs-ledger, under a lock. Edit the text of a task or entry in .xs/ledger; "
+               "xs commits it with the next event about it. xs refuses an EVENTS.log edited by hand."),
+    ("Team", "When main has an upstream, xs pulls the ledger before each command and pushes it after. "
+             "A rejected push undoes the commit, pulls and reruns the command."),
+    ("Chains", "A task with `after: T41` (comma-separated for several) is not ready until each one is done or dropped, "
+               "or is doing or closed on the branch it starts on."),
+    ("start --run", "Launch the \"Agent <agent>: <command>\" line of AGENTS.md in the worktree, with the brief as input "
+                    "(--brief <file>, default the task file). The log is xs-runs/<branch>.log in the git dir. "
+                    "The \"WIP limit: <n>\" line of AGENTS.md sets the limit."),
+    ("Recalls", "Write to $XS_HOME/events.log (default ~/.xs), never to git: one line per read."),
+    ("Event line", "<at> <scope> <subject> <kind> key=value ..."),
+    ("Environment", "XS_NO_PUSH=1 keeps the ledger local. XS_LEDGER names the branch (default xs-ledger). "
+                    "XS_LEDGER_SIGN=1 signs the ledger commits. XS_SCOPE sets the scope (default project/<repo folder>). "
+                    "XS_BY names the actor (default git user.name). MAIN names the base branch (default main). "
+                    "XS_SESSION names the session in a recall."),
+]
+import datetime as dt, fcntl, glob, json, os, re, shutil, subprocess, sys, textwrap
 
 LEDGER = os.environ.get("XS_LEDGER", "xs-ledger")
 LOG = "EVENTS.log"
@@ -1903,9 +1929,29 @@ next:
 """)
 
 
+def print_help():
+    """The command list: the usage in bold, its description below, wrapped to the terminal (no columns)."""
+    tty = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    bold, dim, end = ("\033[1m", "\033[2m", "\033[0m") if tty else ("", "", "")
+    width = min(max(shutil.get_terminal_size().columns, 40), 100)
+
+    def fill(text, first, rest):
+        return textwrap.fill(text, width, initial_indent=first, subsequent_indent=rest,
+                             break_long_words=False, break_on_hyphens=False)
+
+    print(fill(HELP_INTRO, "", ""))
+    for title, rows in HELP:
+        print(f"\n{bold}{title}{end}")
+        for usage, what in rows:
+            print(f"{bold}{fill(usage, '  ', '      ')}{end}\n{fill(what, '      ', '      ')}")
+    print(f"\n{bold}Notes{end}")
+    for name, text in HELP_NOTES:
+        print(fill(f"{name}: {text}", "  ", "      "))
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
-        print(__doc__.strip())
+        print_help()
         return
     here = os.path.dirname(os.path.realpath(__file__))  # before the chdir: __file__ may be relative
     if argv[0] == "install":  # outside any repo
