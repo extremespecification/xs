@@ -14,7 +14,11 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python: ["3.9", "3.x"]  # 3.9: macOS's /usr/bin/python3, the floor users actually have
+        python: ["3.x"]
+        include:
+          # 3.9 is macOS's /usr/bin/python3, the floor users actually have; ubuntu-latest has no 3.9 build
+          - os: macos-latest
+            python: "3.9"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

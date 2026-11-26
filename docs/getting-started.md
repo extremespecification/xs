@@ -6,7 +6,7 @@ Level 1 needs no installation: write a spec as [`template/project/specs/README.m
 
 Duration: about ten minutes, excluding the build.
 
-Requirements: git 2.30 or later, bash, python3, and a coding agent that reads skills (the open Agent Skills standard, `SKILL.md`).
+Requirements: git 2.30 or later, bash, python3 3.9 or later, and a coding agent that reads skills (the open Agent Skills standard, `SKILL.md`).
 
 ## 1. Install the tools
 

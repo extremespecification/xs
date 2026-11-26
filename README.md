@@ -72,7 +72,7 @@ flowchart LR
 
 ## Quick start
 
-Requirements: git, bash, python3, and a coding agent that reads skills of the open [Agent Skills](https://agentskills.io) standard (every such tool gets the skills; Claude Code also gets role definitions and hooks).
+Requirements: git, bash, python3 (3.9 or later), and a coding agent that reads skills of the open [Agent Skills](https://agentskills.io) standard (every such tool gets the skills; Claude Code also gets role definitions and hooks).
 
 ```sh
 git clone https://github.com/extremespecification/xs.git ~/xs
