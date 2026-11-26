@@ -118,7 +118,8 @@ def now():
 
 
 def utc(iso):
-    return dt.datetime.fromisoformat(iso).astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # fromisoformat takes a trailing Z only from Python 3.11; git prints it when the zone is UTC
+    return dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def common():
