@@ -307,14 +307,18 @@ grep -q " T06 agent.finished run=$run exit=0 outcome=doing$" $L || fail "the age
 "$xs" file "Never started" >/dev/null && "$xs" agent T07 started run=x | grep -q 'never started: nothing recorded' || fail "xs agent recorded on a task never started"
 port=$t/otlp.port; body=$t/otlp.json
 python3 -c '
-import http.server, sys
+import http.server, socketserver, sys
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(s):
         open(sys.argv[2], "w").write(s.path + "\n" + s.headers.get("Authorization", "") + "\n" + s.rfile.read(int(s.headers["Content-Length"])).decode())
         s.send_response(200); s.end_headers()
     def log_message(*a): pass
-srv = http.server.HTTPServer(("127.0.0.1", 0), H); srv.timeout = 10; open(sys.argv[1], "w").write(str(srv.server_port)); srv.handle_request()' "$port" "$body" &
-for _ in $(seq 50); do [ -s "$port" ] && break; sleep 0.1; done
+class S(http.server.HTTPServer):
+    def server_bind(s):  # HTTPServer.server_bind calls getfqdn, a reverse DNS lookup that can block for tens of seconds on a macOS runner
+        socketserver.TCPServer.server_bind(s); s.server_port = s.socket.getsockname()[1]
+srv = S(("127.0.0.1", 0), H); srv.timeout = 10; open(sys.argv[1], "w").write(str(srv.server_port)); srv.handle_request()' "$port" "$body" &
+for _ in $(seq 300); do [ -s "$port" ] && break; sleep 0.1; done
+[ -s "$port" ] || fail "the OTLP test server did not start"
 OTEL_EXPORTER_OTLP_ENDPOINT="http://127.0.0.1:$(cat "$port")" OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer%20k" \
   "$xs" agent --branch t06 stopped run=r1 reason=limit resume_at=2026-11-24T03:00:00Z >/dev/null || fail "xs agent --branch stopped failed"
 wait
