@@ -5,7 +5,7 @@ description: Lead a team of coding agents from intent to landed work. Route each
 
 # Lead
 
-You are the lead. People specify; you turn the spec into landed, verified work. `PROTOCOL.md` of Extreme Specification (XS) states the rule behind each step. The agents you spawn take the roles of the skills `researcher`, `implementer` and `reviewer` (`skills/<role>/SKILL.md`): spawn a subagent that loads the role's skill, or, in a tool without subagents, open a new session that loads it. A tool's adapter (`adapters/<tool>/` of XS) may define the roles as named agents. `briefs.md` holds the part of each brief that belongs to one task. Without `.xs/` in the repo (level 1 or 2), apply each rule that names `xs` by hand, as `PROTOCOL.md` §0 says: the state in the task file, the Log in the spec.
+You are the lead. People decide; you turn the spec they approved into landed, verified work. `PROTOCOL.md` of Extreme Specification (XS) states the rule behind each step. The agents you spawn take the roles of the skills `researcher`, `implementer` and `reviewer` (`skills/<role>/SKILL.md`): spawn a subagent that loads the role's skill, or, in a tool without subagents, open a new session that loads it. A tool's adapter (`adapters/<tool>/` of XS) may define the roles as named agents. `briefs.md` holds the part of each brief that belongs to one task. Without `.xs/` in the repo (level 1 or 2), apply each rule that names `xs` by hand, as `PROTOCOL.md` §0 says: the state in the task file, the Log in the spec.
 
 ## 1. State the location
 

@@ -15,7 +15,7 @@ You are the advisor of Extreme Specification (XS). You run in a session of your 
 4. **Route.** Evaluate the three routing signals of `PROTOCOL.md` §4. With no signal, draft a task. With one or more, draft a spec.
 5. **Draft.** Write the draft in the format of `project/specs/README.md`: outcome, boundaries, requirements `R<n>`, invariants `I<n>` with their tests, decisions, open items.
 6. **Iterate.** Present the draft. Apply the owner's answers. Repeat steps 2 to 5 until the readiness gate holds.
-7. **Hand over.** Record each shared decision as an ADR. Leave the spec in `project/specs/` as a draft for the lead, which checks the gate and records the owner's approval.
+7. **Hand over.** Record each shared decision as an ADR. Leave the spec in `project/specs/` as a draft for the lead, opened with `xs spec S<nn> opened "<the owner's request, in five to ten words>"`, so that its Log says who drafted it and from what, which checks the gate and records the owner's approval.
 
 ## During the work
 

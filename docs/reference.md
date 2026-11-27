@@ -39,7 +39,8 @@ Every command, setting and event of the toolset, on one page. The guides show th
 
 | Command | Does |
 |---|---|
-| `xs spec S12 opened\|ready\|done\|dropped` | a spec's status; `ready` runs the readiness gate, `done` checks its invariant tests on `main`. |
+| `xs spec S12 opened ["request"]` | a spec in draft; with a line, `drafted by <you>: request` in its Log. |
+| `xs spec S12 ready\|done\|dropped` | a spec's status; `ready` runs the readiness gate, `done` checks its invariant tests on `main`. |
 | `xs spec S12 approved\|deviated\|noted "line"` | a dated line in the spec's Log, with its event. |
 | `xs adr 0007 proposed\|accepted\|retired ["line"]`, `xs adr 0007 built "…"`, `xs adr 0007 amended "…"` | an ADR's status, as events; the file is never edited. |
 | `xs release NAME [--commit SHA]`, `xs rollback NAME "reason"` | a release and its rollback. |

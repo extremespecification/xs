@@ -1,6 +1,6 @@
 # Specs
 
-One file per change. A spec is the main input people write: it states the result, its requirements and its invariants. Tasks derive from it. A `done` spec is history: a later change to the same feature gets a new spec that cites it.
+One file per change. A spec is drafted by an agent from the owner's request, to show what it understood before it builds, and approved by the owner: it states the result, its requirements and its invariants. Tasks derive from it. A `done` spec is history: a later change to the same feature gets a new spec that cites it.
 
 Write a spec when one of the three signals of `PROTOCOL.md` §4 holds. Otherwise file a task directly.
 

@@ -1,7 +1,7 @@
 <h1 align="center">Extreme Specification (XS)</h1>
 
 <p align="center">
-  <strong>A method for autonomous programming. People specify; agents build, verify and integrate.</strong>
+  <strong>A method for autonomous programming. People decide; agents specify, build, verify and integrate.</strong>
 </p>
 
 <p align="center">
@@ -29,7 +29,7 @@
 
 Extreme Programming turned the practices that worked up to the maximum, because writing code was the bottleneck. With coding agents, code is cheap and **human attention is scarce**. XS turns up the specification instead: a spec is one page, every requirement has an id, every invariant (a rule of the domain that must always hold) has a test, and the spec records decisions while the work goes on. "Extreme" refers to rigor, not length.
 
-Four values follow: **specifications over conversations, proof over claims, integrated work over finished work, enforced rules over written rules.**
+Four values follow: **specifications over transcripts, proof over claims, integrated work over finished work, enforced rules over written rules.**
 
 The [website](https://extremespecification.com) explains the method in one page; this repository holds the protocol, the guides and the toolset.
 

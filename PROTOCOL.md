@@ -1,6 +1,6 @@
 # Extreme Specification (XS)
 
-A method for autonomous programming. People specify; agents build, verify and integrate.
+A method for autonomous programming. People decide; agents specify, build, verify and integrate.
 
 The name follows Extreme Programming. XP took each practice that worked and turned it up to the maximum: if review helps, review all the time (pair programming); if tests help, write them first (TDD). Writing code was the bottleneck. With agents, code is cheap and human attention is scarce, so XS turns up the specification:
 
@@ -8,7 +8,7 @@ The name follows Extreme Programming. XP took each practice that worked and turn
 - **Verifiable**: every requirement has an id, every invariant has a test.
 - **Current**: the spec records decisions and discoveries while the work goes on.
 
-XP preferred conversation to written specifications. XS reverses that on purpose: agents do not attend the conversation, so what it decides must be written down. "Extreme" refers to the rigor of the spec, not its length.
+XP kept agreement in conversation. XS keeps the conversation, and ends it with a page: the agent writes down what it understood, and the owner corrects and approves it. The agents who build were not in the conversation, so what it decides must be written down. "Extreme" refers to the rigor of the spec, not its length.
 
 Each rule below is one imperative statement, the principle it derives from, the level that adopts it, and one line of evidence. `EVIDENCE.md` holds the full data under the cited number. The evidence comes from building products with Claude Code. Rules marked "Evidence: none" were adopted from the BMAD method or designed, and have not yet been measured. Rules for teams live in `docs/adopt-in-a-team.md` and are experimental.
 
@@ -42,7 +42,7 @@ XS is adopted in four levels. Each level is complete on its own. A project moves
 
 | Term | Definition |
 |---|---|
-| Spec | The one-page document that states a change: its outcome, requirements and invariants. The main input people write. |
+| Spec | The one-page document that states a change: its outcome, requirements and invariants. Drafted by an agent from the owner's request, to show what it understood before it builds; approved by the owner. |
 | Requirement | A verifiable statement in a spec, identified as `R<n>`. |
 | Invariant | A rule of the domain that must hold after every change, identified as `I<n>` in its spec and bound to a test whose name starts with `S<nn> I<n>`, in any case, with spaces or underscores. Invariants of the whole product live in `S00`, a spec that never closes. |
 | Decision | A choice that constrains code, recorded as an ADR. |
@@ -101,8 +101,8 @@ The reference toolset keeps the ledger on `xs-ledger`, a branch with no history 
 
 | Artifact | Path | Holds | Writer |
 |---|---|---|---|
-| Spec | `project/specs/S<nn>-slug.md`, on `main` | outcome, requirements, invariants, decisions | its owner; changed through a branch and `land`, like code |
-| Log of a spec | `logs/S<nn>.md`, in the ledger | dated lines: approvals, decisions, discoveries, deviations | the lead, with `xs spec <id> approved\|deviated\|noted` |
+| Spec | `project/specs/S<nn>-slug.md`, on `main` | outcome, requirements, invariants, decisions | the advisor or the lead drafts it, its owner approves it; changed through a branch and `land`, like code |
+| Log of a spec | `logs/S<nn>.md`, in the ledger | dated lines: who drafted it, approvals, decisions, discoveries, deviations | the advisor or the lead, with `xs spec <id> opened\|approved\|deviated\|noted` |
 | Task | `tasks/T<nn>-slug.md`, in the ledger | one deliverable and its proof; no state | the lead files it, the worker writes its Done section; its state only through `xs` |
 | ADR | `project/adr/NNNN-sentence.md`, on `main` | one decision that constrains code, frozen whole | the lead, on the owner's answer; its state only through `xs adr` |
 | Rules | `AGENTS.md` | rules of the repo, numbered | the lead, on the owner's approval |

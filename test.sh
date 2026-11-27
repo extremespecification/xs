@@ -183,6 +183,12 @@ out=$("$xs" spec S01 ready 2>&1) || true
 grep -q "has not approved" <<<"$out" && fail "xs spec ready asked for an approval AGENTS.md waives"
 git checkout -q AGENTS.md
 printf -- "$spec" > project/specs/S01-a.md && "$xs" adr 0009 proposed >/dev/null
+# the agent drafts, the owner approves: opened with a line names who drafted the spec in its Log
+"$xs" spec S01 opened "an export of orders, from the owner's request" >/dev/null || fail "xs spec opened refused a line"
+grep -q "^- [0-9-]*: drafted by test: an export of orders, from the owner's request$" .xs/ledger/logs/S01.md || fail "xs spec opened wrote no drafted-by line"
+"$xs" spec S01 opened >/dev/null || fail "xs spec opened refused no line"
+"$xs" spec S01 ready "a line" >/dev/null 2>&1 && fail "xs spec ready took a line"
+"$xs" spec S01 approved >/dev/null 2>&1 && fail "xs spec approved took no line"
 "$xs" spec S01 approved "the outcome and R1-R3" >/dev/null
 out=$("$xs" spec S01 ready 2>&1) && fail "xs spec ready took a spec whose ADR is only proposed"
 grep -q "ADR 0009 is not accepted" <<<"$out" || fail "xs spec ready refused a proposed ADR for another reason: $out"
